@@ -35,13 +35,19 @@ PFN_xrCreateHandTrackerEXT gNextCreateHandTracker = nullptr;
 PFN_xrDestroyHandTrackerEXT gNextDestroyHandTracker = nullptr;
 PFN_xrLocateHandJointsEXT gNextLocateHandJoints = nullptr;
 PFN_xrEndFrame gNextEndFrame = nullptr;
+PFN_xrCreateReferenceSpace gNextCreateReferenceSpace = nullptr;
+PFN_xrDestroySpace gNextDestroySpace = nullptr;
 uint64_t gEndFrameCallCount = 0;
 bool gLoggedCreateHandTrackerIntercept = false;
 bool gLoggedDestroyHandTrackerIntercept = false;
 bool gLoggedLocateHandJointsIntercept = false;
 bool gLoggedEndFrameIntercept = false;
+bool gLoggedCreateReferenceSpaceIntercept = false;
+bool gLoggedDestroySpaceIntercept = false;
+bool gLoggedLocateHandJointsRequest = false;
 std::unordered_map<XrInstance, InstanceDispatch> gInstanceDispatch;
 std::unordered_map<XrHandTrackerEXT, HandTrackerDispatch> gHandTrackerDispatch;
+std::unordered_map<XrSpace, XrReferenceSpaceType> gReferenceSpaceTypes;
 
 std::string logPath() {
     char localAppData[MAX_PATH]{};
@@ -113,6 +119,113 @@ XRAPI_ATTR XrResult XRAPI_CALL layerDestroyInstance(XrInstance instance) {
     if (XR_SUCCEEDED(result)) {
         removeInstanceDispatch(instance);
         logLine("Instance dispatch table removed");
+    }
+
+    return result;
+}
+
+const char* referenceSpaceTypeName(XrReferenceSpaceType type) {
+    switch (type) {
+        case XR_REFERENCE_SPACE_TYPE_VIEW:
+            return "VIEW";
+        case XR_REFERENCE_SPACE_TYPE_LOCAL:
+            return "LOCAL";
+        case XR_REFERENCE_SPACE_TYPE_STAGE:
+            return "STAGE";
+#ifdef XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR_EXT
+        case XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR_EXT:
+            return "LOCAL_FLOOR_EXT";
+#endif
+        default:
+            return "UNKNOWN";
+    }
+}
+
+const char* knownSpaceTypeName(XrSpace space) {
+    std::lock_guard<std::mutex> lock(gStateMutex);
+    const auto iterator = gReferenceSpaceTypes.find(space);
+    if (iterator == gReferenceSpaceTypes.end()) {
+        return "UNTRACKED_SPACE";
+    }
+
+    return referenceSpaceTypeName(iterator->second);
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layerCreateReferenceSpace(
+    XrSession session,
+    const XrReferenceSpaceCreateInfo* createInfo,
+    XrSpace* space
+) {
+    PFN_xrCreateReferenceSpace nextCreateReferenceSpace = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        nextCreateReferenceSpace = gNextCreateReferenceSpace;
+    }
+
+    if (nextCreateReferenceSpace == nullptr) {
+        logLine("xrCreateReferenceSpace: downstream function unavailable");
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+
+    const XrResult result =
+        nextCreateReferenceSpace(session, createInfo, space);
+
+    if (
+        XR_SUCCEEDED(result) &&
+        createInfo != nullptr &&
+        space != nullptr &&
+        *space != XR_NULL_HANDLE
+    ) {
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gReferenceSpaceTypes[*space] = createInfo->referenceSpaceType;
+        }
+
+        logLine(
+            std::string("Reference space created: type=") +
+            referenceSpaceTypeName(createInfo->referenceSpaceType)
+        );
+    } else {
+        logLine(
+            std::string("xrCreateReferenceSpace result: ") +
+            std::to_string(static_cast<int>(result))
+        );
+    }
+
+    return result;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layerDestroySpace(
+    XrSpace space
+) {
+    PFN_xrDestroySpace nextDestroySpace = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        nextDestroySpace = gNextDestroySpace;
+    }
+
+    if (nextDestroySpace == nullptr) {
+        logLine("xrDestroySpace: downstream function unavailable");
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+
+    const char* trackedType = knownSpaceTypeName(space);
+    const XrResult result = nextDestroySpace(space);
+
+    if (XR_SUCCEEDED(result)) {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        gReferenceSpaceTypes.erase(space);
+    }
+
+    if (std::strcmp(trackedType, "UNTRACKED_SPACE") != 0) {
+        logLine(
+            std::string("Reference space destroyed: type=") +
+            trackedType +
+            ", result=" +
+            std::to_string(static_cast<int>(result))
+        );
     }
 
     return result;
@@ -299,6 +412,12 @@ XRAPI_ATTR XrResult XRAPI_CALL layerLocateHandJointsEXT(
             (locations->isActive == XR_TRUE ? "true" : "false") +
             ", jointCount=" +
             std::to_string(locations->jointCount) +
+            ", baseSpaceType=" +
+            (
+                locateInfo != nullptr
+                    ? knownSpaceTypeName(locateInfo->baseSpace)
+                    : "NO_LOCATE_INFO"
+            ) +
             ", call=" +
             std::to_string(callCount)
         );
@@ -374,7 +493,20 @@ XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
         return XR_ERROR_VALIDATION_FAILURE;
     }
 
-    logLine(std::string("xrGetInstanceProcAddr requested: ") + name);
+    bool shouldLogRequest = true;
+
+    if (std::strcmp(name, "xrLocateHandJointsEXT") == 0) {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        if (gLoggedLocateHandJointsRequest) {
+            shouldLogRequest = false;
+        } else {
+            gLoggedLocateHandJointsRequest = true;
+        }
+    }
+
+    if (shouldLogRequest) {
+        logLine(std::string("xrGetInstanceProcAddr requested: ") + name);
+    }
 
     *function = nullptr;
 
@@ -419,6 +551,10 @@ XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
         std::strcmp(name, "xrLocateHandJointsEXT") == 0;
     const bool isEndFrame =
         std::strcmp(name, "xrEndFrame") == 0;
+    const bool isCreateReferenceSpace =
+        std::strcmp(name, "xrCreateReferenceSpace") == 0;
+    const bool isDestroySpace =
+        std::strcmp(name, "xrDestroySpace") == 0;
 
     const XrResult result =
         nextGetInstanceProcAddr(instance, name, function);
@@ -516,6 +652,46 @@ XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
 
         if (shouldLog) {
             logLine("Intercepting xrEndFrame");
+        }
+    } else if (isCreateReferenceSpace) {
+        bool shouldLog = false;
+
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gNextCreateReferenceSpace =
+                reinterpret_cast<PFN_xrCreateReferenceSpace>(*function);
+
+            if (!gLoggedCreateReferenceSpaceIntercept) {
+                gLoggedCreateReferenceSpaceIntercept = true;
+                shouldLog = true;
+            }
+        }
+
+        *function =
+            reinterpret_cast<PFN_xrVoidFunction>(layerCreateReferenceSpace);
+
+        if (shouldLog) {
+            logLine("Intercepting xrCreateReferenceSpace");
+        }
+    } else if (isDestroySpace) {
+        bool shouldLog = false;
+
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gNextDestroySpace =
+                reinterpret_cast<PFN_xrDestroySpace>(*function);
+
+            if (!gLoggedDestroySpaceIntercept) {
+                gLoggedDestroySpaceIntercept = true;
+                shouldLog = true;
+            }
+        }
+
+        *function =
+            reinterpret_cast<PFN_xrVoidFunction>(layerDestroySpace);
+
+        if (shouldLog) {
+            logLine("Intercepting xrDestroySpace");
         }
     }
 
