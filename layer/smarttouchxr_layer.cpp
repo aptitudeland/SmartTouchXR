@@ -109,6 +109,8 @@ XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
         return XR_ERROR_VALIDATION_FAILURE;
     }
 
+    logLine(std::string("xrGetInstanceProcAddr requested: ") + name);
+
     *function = nullptr;
 
     if (std::strcmp(name, "xrGetInstanceProcAddr") == 0) {
@@ -140,10 +142,22 @@ XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
     }
 
     if (nextGetInstanceProcAddr == nullptr) {
+        logLine(std::string("xrGetInstanceProcAddr unavailable for: ") + name);
         return XR_ERROR_FUNCTION_UNSUPPORTED;
     }
 
-    return nextGetInstanceProcAddr(instance, name, function);
+    const XrResult result = nextGetInstanceProcAddr(instance, name, function);
+
+    if (XR_FAILED(result)) {
+        logLine(
+            std::string("xrGetInstanceProcAddr lookup failed for ") +
+            name +
+            ": " +
+            std::to_string(static_cast<int>(result))
+        );
+    }
+
+    return result;
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL layerCreateApiLayerInstance(
