@@ -1,6 +1,15 @@
 #include <windows.h>
+#include <unknwn.h>
+#include <d3d11.h>
+#include <d3d12.h>
+#include <GL/gl.h>
 
+#define XR_USE_PLATFORM_WIN32
+#define XR_USE_GRAPHICS_API_D3D11
+#define XR_USE_GRAPHICS_API_D3D12
+#define XR_USE_GRAPHICS_API_OPENGL
 #include <openxr/openxr.h>
+#include <openxr/openxr_platform.h>
 #include <openxr/openxr_loader_negotiation.h>
 
 #include <algorithm>
@@ -37,6 +46,7 @@ PFN_xrLocateHandJointsEXT gNextLocateHandJoints = nullptr;
 PFN_xrEndFrame gNextEndFrame = nullptr;
 PFN_xrCreateReferenceSpace gNextCreateReferenceSpace = nullptr;
 PFN_xrDestroySpace gNextDestroySpace = nullptr;
+PFN_xrCreateSession gNextCreateSession = nullptr;
 uint64_t gEndFrameCallCount = 0;
 bool gLoggedCreateHandTrackerIntercept = false;
 bool gLoggedDestroyHandTrackerIntercept = false;
@@ -45,6 +55,7 @@ bool gLoggedEndFrameIntercept = false;
 bool gLoggedCreateReferenceSpaceIntercept = false;
 bool gLoggedDestroySpaceIntercept = false;
 bool gLoggedLocateHandJointsRequest = false;
+bool gLoggedCreateSessionIntercept = false;
 std::unordered_map<XrInstance, InstanceDispatch> gInstanceDispatch;
 std::unordered_map<XrHandTrackerEXT, HandTrackerDispatch> gHandTrackerDispatch;
 std::unordered_map<XrSpace, XrReferenceSpaceType> gReferenceSpaceTypes;
@@ -120,6 +131,126 @@ XRAPI_ATTR XrResult XRAPI_CALL layerDestroyInstance(XrInstance instance) {
         removeInstanceDispatch(instance);
         logLine("Instance dispatch table removed");
     }
+
+    return result;
+}
+
+const char* structureTypeName(XrStructureType type) {
+    switch (type) {
+        case XR_TYPE_GRAPHICS_BINDING_D3D11_KHR:
+            return "GRAPHICS_BINDING_D3D11_KHR";
+        case XR_TYPE_GRAPHICS_BINDING_D3D12_KHR:
+            return "GRAPHICS_BINDING_D3D12_KHR";
+        case XR_TYPE_GRAPHICS_BINDING_OPENGL_WIN32_KHR:
+            return "GRAPHICS_BINDING_OPENGL_WIN32_KHR";
+        default:
+            return "OTHER_STRUCTURE";
+    }
+}
+
+void logSessionCreateChain(const void* next) {
+    if (next == nullptr) {
+        logLine("xrCreateSession next chain: empty");
+        return;
+    }
+
+    const XrBaseInStructure* current =
+        reinterpret_cast<const XrBaseInStructure*>(next);
+    uint32_t index = 0;
+
+    while (current != nullptr && index < 32) {
+        logLine(
+            std::string("xrCreateSession next[") +
+            std::to_string(index) +
+            "]: type=" +
+            structureTypeName(current->type) +
+            " (" +
+            std::to_string(static_cast<int>(current->type)) +
+            ")"
+        );
+
+        switch (current->type) {
+            case XR_TYPE_GRAPHICS_BINDING_D3D11_KHR: {
+                const auto* binding =
+                    reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(current);
+                logLine(
+                    std::string("Detected graphics API: D3D11, device=") +
+                    (binding->device != nullptr ? "present" : "null")
+                );
+                break;
+            }
+            case XR_TYPE_GRAPHICS_BINDING_D3D12_KHR: {
+                const auto* binding =
+                    reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(current);
+                logLine(
+                    std::string("Detected graphics API: D3D12, device=") +
+                    (binding->device != nullptr ? "present" : "null") +
+                    ", queue=" +
+                    (binding->queue != nullptr ? "present" : "null")
+                );
+                break;
+            }
+            case XR_TYPE_GRAPHICS_BINDING_OPENGL_WIN32_KHR: {
+                const auto* binding =
+                    reinterpret_cast<const XrGraphicsBindingOpenGLWin32KHR*>(current);
+                logLine(
+                    std::string("Detected graphics API: OpenGL Win32, hDC=") +
+                    (binding->hDC != nullptr ? "present" : "null") +
+                    ", hGLRC=" +
+                    (binding->hGLRC != nullptr ? "present" : "null")
+                );
+                break;
+            }
+            default:
+                break;
+        }
+
+        current = current->next;
+        ++index;
+    }
+
+    if (index >= 32) {
+        logLine("xrCreateSession next chain stopped after 32 entries");
+    }
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layerCreateSession(
+    XrInstance instance,
+    const XrSessionCreateInfo* createInfo,
+    XrSession* session
+) {
+    PFN_xrCreateSession nextCreateSession = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        nextCreateSession = gNextCreateSession;
+    }
+
+    if (nextCreateSession == nullptr) {
+        logLine("xrCreateSession: downstream function unavailable");
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+
+    logLine("Forwarding xrCreateSession");
+
+    if (createInfo != nullptr) {
+        logSessionCreateChain(createInfo->next);
+    } else {
+        logLine("xrCreateSession received null createInfo");
+    }
+
+    const XrResult result = nextCreateSession(instance, createInfo, session);
+
+    logLine(
+        std::string("xrCreateSession result: ") +
+        std::to_string(static_cast<int>(result)) +
+        ", session=" +
+        (
+            session != nullptr && *session != XR_NULL_HANDLE
+                ? "created"
+                : "null"
+        )
+    );
 
     return result;
 }
@@ -555,6 +686,8 @@ XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
         std::strcmp(name, "xrCreateReferenceSpace") == 0;
     const bool isDestroySpace =
         std::strcmp(name, "xrDestroySpace") == 0;
+    const bool isCreateSession =
+        std::strcmp(name, "xrCreateSession") == 0;
 
     const XrResult result =
         nextGetInstanceProcAddr(instance, name, function);
@@ -692,6 +825,26 @@ XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
 
         if (shouldLog) {
             logLine("Intercepting xrDestroySpace");
+        }
+    } else if (isCreateSession) {
+        bool shouldLog = false;
+
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gNextCreateSession =
+                reinterpret_cast<PFN_xrCreateSession>(*function);
+
+            if (!gLoggedCreateSessionIntercept) {
+                gLoggedCreateSessionIntercept = true;
+                shouldLog = true;
+            }
+        }
+
+        *function =
+            reinterpret_cast<PFN_xrVoidFunction>(layerCreateSession);
+
+        if (shouldLog) {
+            logLine("Intercepting xrCreateSession");
         }
     }
 
