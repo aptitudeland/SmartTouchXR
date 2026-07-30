@@ -90,7 +90,8 @@ std::unordered_map<XrHandTrackerEXT, HandTrackerDispatch> gHandTrackerDispatch;
 std::unordered_map<XrSpace, XrReferenceSpaceType> gReferenceSpaceTypes;
 std::unordered_map<XrSwapchain, SwapchainState> gSwapchainStates;
 uint32_t gNextEyeIndex = 0;
-bool gLoggedStereoCubeDraw = false;
+bool gLoggedIndexTipCubeDraw = false;
+bool gLoggedIndexTipTrackingReady = false;
 bool gLoggedStereoViewSample = false;
 std::array<XrView, 2> gLatestViews{{
     {XR_TYPE_VIEW},
@@ -98,6 +99,12 @@ std::array<XrView, 2> gLatestViews{{
 }};
 uint32_t gLatestViewCount = 0;
 XrViewStateFlags gLatestViewStateFlags = 0;
+XrSpace gLatestViewSpace = XR_NULL_HANDLE;
+XrVector3f gLatestRightIndexTip{0.0f, 0.0f, 0.0f};
+XrSpace gLatestRightIndexBaseSpace = XR_NULL_HANDLE;
+XrTime gLatestRightIndexTime = 0;
+XrSpaceLocationFlags gLatestRightIndexFlags = 0;
+bool gLatestRightIndexValid = false;
 
 std::string logPath() {
     char localAppData[MAX_PATH]{};
@@ -795,7 +802,7 @@ void appendLineRectangles(
     }
 }
 
-void drawFixedStereoCube(XrSwapchain swapchain, int64_t imageIndex) {
+void drawTrackedIndexTipCube(XrSwapchain swapchain, int64_t imageIndex) {
     ID3D11RenderTargetView* renderTargetView = nullptr;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -803,6 +810,7 @@ void drawFixedStereoCube(XrSwapchain swapchain, int64_t imageIndex) {
     XrView eyeView{XR_TYPE_VIEW};
     XrView leftView{XR_TYPE_VIEW};
     XrView rightView{XR_TYPE_VIEW};
+    XrVector3f rightIndexTip{0.0f, 0.0f, 0.0f};
 
     {
         std::lock_guard<std::mutex> lock(gStateMutex);
@@ -813,7 +821,10 @@ void drawFixedStereoCube(XrSwapchain swapchain, int64_t imageIndex) {
             static_cast<size_t>(imageIndex) >= it->second.renderTargetViews.size() ||
             gLatestViewCount < 2 ||
             (gLatestViewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) == 0 ||
-            (gLatestViewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0
+            (gLatestViewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0 ||
+            !gLatestRightIndexValid ||
+            gLatestViewSpace == XR_NULL_HANDLE ||
+            gLatestRightIndexBaseSpace != gLatestViewSpace
         ) {
             return;
         }
@@ -830,28 +841,24 @@ void drawFixedStereoCube(XrSwapchain swapchain, int64_t imageIndex) {
         eyeView = gLatestViews[eyeIndex];
         leftView = gLatestViews[0];
         rightView = gLatestViews[1];
+        rightIndexTip = gLatestRightIndexTip;
     }
 
-    // Build a head pose from the midpoint between both eyes. The left-eye
-    // orientation is a suitable approximation because both views share the
-    // same head orientation in normal stereo configurations.
-    const Vec3 leftPosition{
-        leftView.pose.position.x,
-        leftView.pose.position.y,
-        leftView.pose.position.z
-    };
-    const Vec3 rightPosition{
-        rightView.pose.position.x,
-        rightView.pose.position.y,
-        rightView.pose.position.z
-    };
-    const Vec3 headPosition = scale(add(leftPosition, rightPosition), 0.5f);
+    // Use the current head orientation only to orient the small wireframe.
+    // Its center comes directly from the tracked right index fingertip.
     const Vec3 forward = rotateByQuaternion(leftView.pose.orientation, {0.0f, 0.0f, -1.0f});
     const Vec3 right = rotateByQuaternion(leftView.pose.orientation, {1.0f, 0.0f, 0.0f});
     const Vec3 up = rotateByQuaternion(leftView.pose.orientation, {0.0f, 1.0f, 0.0f});
 
-    const Vec3 cubeCenter = add(headPosition, scale(forward, 0.65f));
-    constexpr float kHalfSize = 0.035f;
+    // The hand joint and the eye views are both expressed in the exact same
+    // OpenXR base space. This lets us project the fingertip directly into each
+    // eye without an additional coordinate conversion.
+    const Vec3 cubeCenter{
+        rightIndexTip.x,
+        rightIndexTip.y,
+        rightIndexTip.z
+    };
+    constexpr float kHalfSize = 0.0125f;
     std::array<Vec3, 8> corners{};
     size_t cornerIndex = 0;
     for (int z = -1; z <= 1; z += 2) {
@@ -957,13 +964,13 @@ void drawFixedStereoCube(XrSwapchain swapchain, int64_t imageIndex) {
     bool shouldLog = false;
     {
         std::lock_guard<std::mutex> lock(gStateMutex);
-        if (!gLoggedStereoCubeDraw) {
-            gLoggedStereoCubeDraw = true;
+        if (!gLoggedIndexTipCubeDraw) {
+            gLoggedIndexTipCubeDraw = true;
             shouldLog = true;
         }
     }
     if (shouldLog) {
-        logLine("Stereo-projected fixed cube draw submitted successfully");
+        logLine("Stereo-projected right index-tip cube draw submitted successfully");
     }
 }
 
@@ -987,7 +994,7 @@ XRAPI_ATTR XrResult XRAPI_CALL layerReleaseSwapchainImage(
         return XR_ERROR_FUNCTION_UNSUPPORTED;
     }
 
-    drawFixedStereoCube(swapchain, lastIndex);
+    drawTrackedIndexTipCube(swapchain, lastIndex);
 
     const XrResult result = nextRelease(swapchain, releaseInfo);
     uint64_t callCount = 0;
@@ -1280,6 +1287,52 @@ XRAPI_ATTR XrResult XRAPI_CALL layerLocateHandJointsEXT(
         return result;
     }
 
+    if (dispatch.hand == XR_HAND_RIGHT_EXT) {
+        const uint32_t indexTip =
+            static_cast<uint32_t>(XR_HAND_JOINT_INDEX_TIP_EXT);
+        bool valid = false;
+        XrVector3f position{0.0f, 0.0f, 0.0f};
+        XrSpaceLocationFlags flags = 0;
+
+        if (
+            locateInfo != nullptr &&
+            locations != nullptr &&
+            locations->isActive == XR_TRUE &&
+            locations->jointLocations != nullptr &&
+            locations->jointCount > indexTip
+        ) {
+            const XrHandJointLocationEXT& joint =
+                locations->jointLocations[indexTip];
+            flags = joint.locationFlags;
+            valid =
+                (flags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0 &&
+                (flags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT) != 0;
+            if (valid) {
+                position = joint.pose.position;
+            }
+        }
+
+        bool shouldLogReady = false;
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gLatestRightIndexValid = valid;
+            gLatestRightIndexFlags = flags;
+            if (valid) {
+                gLatestRightIndexTip = position;
+                gLatestRightIndexBaseSpace = locateInfo->baseSpace;
+                gLatestRightIndexTime = locateInfo->time;
+                if (!gLoggedIndexTipTrackingReady) {
+                    gLoggedIndexTipTrackingReady = true;
+                    shouldLogReady = true;
+                }
+            }
+        }
+
+        if (shouldLogReady) {
+            logLine("Right index-tip tracking ready for stereo rendering");
+        }
+    }
+
     bool shouldLog = callCount == 1 || (callCount != 0 && callCount % 300 == 0);
 
     {
@@ -1384,6 +1437,8 @@ XRAPI_ATTR XrResult XRAPI_CALL layerLocateViews(
             gLatestViews[1] = views[1];
             gLatestViewCount = 2;
             gLatestViewStateFlags = viewState->viewStateFlags;
+            gLatestViewSpace =
+                viewLocateInfo != nullptr ? viewLocateInfo->space : XR_NULL_HANDLE;
             if (!gLoggedStereoViewSample) {
                 gLoggedStereoViewSample = true;
                 shouldLog = true;
