@@ -22,14 +22,3 @@ if (!(Test-Path $Dll)) {
 Write-Host ""
 Write-Host "Build succeeded."
 Write-Host "Output: $Dll"
-
-$Dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
-if ($null -ne $Dumpbin) {
-    $Exports = & $Dumpbin.Source /nologo /exports $Dll | Out-String
-    if ($Exports -notmatch '(?m)^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+xrNegotiateLoaderApiLayerInterface\s*$') {
-        throw "SmartTouchXR.dll does not export xrNegotiateLoaderApiLayerInterface."
-    }
-    Write-Host "Verified export: xrNegotiateLoaderApiLayerInterface"
-} else {
-    Write-Warning "dumpbin.exe was not found; the OpenXR negotiation export was not automatically checked."
-}

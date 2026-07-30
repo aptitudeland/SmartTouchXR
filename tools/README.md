@@ -32,7 +32,3 @@ The project is developed incrementally:
 ## Status
 
 Early prototype.
-
-## Export du point d'entrée OpenXR
-
-La DLL doit exporter exactement `xrNegotiateLoaderApiLayerInterface`. Le projet utilise à la fois `__declspec(dllexport)` et `SmartTouchXR.def`, puis `build.ps1` contrôle l'export avec `dumpbin` lorsqu'il est disponible.

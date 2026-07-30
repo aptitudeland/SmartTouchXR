@@ -134,7 +134,7 @@ XRAPI_ATTR XrResult XRAPI_CALL layerCreateApiLayerInstance(
 
 extern "C" {
 
-__declspec(dllexport) XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoaderApiLayerInterface(
+XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoaderApiLayerInterface(
     const XrNegotiateLoaderInfo* loaderInfo,
     const char* layerName,
     XrNegotiateApiLayerRequest* apiLayerRequest

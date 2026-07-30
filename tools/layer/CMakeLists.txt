@@ -15,12 +15,7 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(OpenXRSDK)
 
-add_library(
-    SmartTouchXR
-    SHARED
-    smarttouchxr_layer.cpp
-    SmartTouchXR.def
-)
+add_library(SmartTouchXR SHARED smarttouchxr_layer.cpp)
 
 target_link_libraries(
     SmartTouchXR
