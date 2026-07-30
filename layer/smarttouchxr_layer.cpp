@@ -14,6 +14,8 @@
 #include <openxr/openxr_loader_negotiation.h>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -57,6 +59,7 @@ PFN_xrCreateHandTrackerEXT gNextCreateHandTracker = nullptr;
 PFN_xrDestroyHandTrackerEXT gNextDestroyHandTracker = nullptr;
 PFN_xrLocateHandJointsEXT gNextLocateHandJoints = nullptr;
 PFN_xrEndFrame gNextEndFrame = nullptr;
+PFN_xrLocateViews gNextLocateViews = nullptr;
 PFN_xrCreateReferenceSpace gNextCreateReferenceSpace = nullptr;
 PFN_xrDestroySpace gNextDestroySpace = nullptr;
 PFN_xrCreateSession gNextCreateSession = nullptr;
@@ -71,6 +74,7 @@ bool gLoggedCreateHandTrackerIntercept = false;
 bool gLoggedDestroyHandTrackerIntercept = false;
 bool gLoggedLocateHandJointsIntercept = false;
 bool gLoggedEndFrameIntercept = false;
+bool gLoggedLocateViewsIntercept = false;
 bool gLoggedCreateReferenceSpaceIntercept = false;
 bool gLoggedDestroySpaceIntercept = false;
 bool gLoggedLocateHandJointsRequest = false;
@@ -87,6 +91,13 @@ std::unordered_map<XrSpace, XrReferenceSpaceType> gReferenceSpaceTypes;
 std::unordered_map<XrSwapchain, SwapchainState> gSwapchainStates;
 uint32_t gNextEyeIndex = 0;
 bool gLoggedStereoCubeDraw = false;
+bool gLoggedStereoViewSample = false;
+std::array<XrView, 2> gLatestViews{{
+    {XR_TYPE_VIEW},
+    {XR_TYPE_VIEW}
+}};
+uint32_t gLatestViewCount = 0;
+XrViewStateFlags gLatestViewStateFlags = 0;
 
 std::string logPath() {
     char localAppData[MAX_PATH]{};
@@ -661,11 +672,137 @@ XRAPI_ATTR XrResult XRAPI_CALL layerWaitSwapchainImage(
     return result;
 }
 
+struct Vec3 {
+    float x;
+    float y;
+    float z;
+};
+
+Vec3 subtract(const Vec3& a, const Vec3& b) {
+    return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+Vec3 add(const Vec3& a, const Vec3& b) {
+    return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
+Vec3 scale(const Vec3& value, float factor) {
+    return {value.x * factor, value.y * factor, value.z * factor};
+}
+
+Vec3 rotateByQuaternion(const XrQuaternionf& q, const Vec3& value) {
+    const Vec3 u{q.x, q.y, q.z};
+    const float scalar = q.w;
+    const float dotUV = u.x * value.x + u.y * value.y + u.z * value.z;
+    const float dotUU = u.x * u.x + u.y * u.y + u.z * u.z;
+    const Vec3 cross{
+        u.y * value.z - u.z * value.y,
+        u.z * value.x - u.x * value.z,
+        u.x * value.y - u.y * value.x
+    };
+
+    return add(
+        add(scale(u, 2.0f * dotUV), scale(value, scalar * scalar - dotUU)),
+        scale(cross, 2.0f * scalar)
+    );
+}
+
+Vec3 inverseRotateByQuaternion(const XrQuaternionf& q, const Vec3& value) {
+    const XrQuaternionf inverse{-q.x, -q.y, -q.z, q.w};
+    return rotateByQuaternion(inverse, value);
+}
+
+bool projectWorldPoint(
+    const Vec3& worldPoint,
+    const XrView& view,
+    uint32_t width,
+    uint32_t height,
+    LONG* pixelX,
+    LONG* pixelY
+) {
+    if (pixelX == nullptr || pixelY == nullptr) {
+        return false;
+    }
+
+    const Vec3 eyePosition{
+        view.pose.position.x,
+        view.pose.position.y,
+        view.pose.position.z
+    };
+    const Vec3 relative = subtract(worldPoint, eyePosition);
+    const Vec3 eyePoint = inverseRotateByQuaternion(view.pose.orientation, relative);
+
+    // OpenXR looks down negative Z.
+    if (eyePoint.z >= -0.05f) {
+        return false;
+    }
+
+    const float tanLeft = std::tan(view.fov.angleLeft);
+    const float tanRight = std::tan(view.fov.angleRight);
+    const float tanDown = std::tan(view.fov.angleDown);
+    const float tanUp = std::tan(view.fov.angleUp);
+    const float horizontalRange = tanRight - tanLeft;
+    const float verticalRange = tanUp - tanDown;
+    if (horizontalRange <= 0.0f || verticalRange <= 0.0f) {
+        return false;
+    }
+
+    const float tangentX = eyePoint.x / -eyePoint.z;
+    const float tangentY = eyePoint.y / -eyePoint.z;
+    const float normalizedX = (tangentX - tanLeft) / horizontalRange;
+    const float normalizedY = (tanUp - tangentY) / verticalRange;
+
+    if (
+        normalizedX < -0.25f || normalizedX > 1.25f ||
+        normalizedY < -0.25f || normalizedY > 1.25f
+    ) {
+        return false;
+    }
+
+    *pixelX = static_cast<LONG>(normalizedX * static_cast<float>(width));
+    *pixelY = static_cast<LONG>(normalizedY * static_cast<float>(height));
+    return true;
+}
+
+void appendLineRectangles(
+    std::vector<D3D11_RECT>* rectangles,
+    LONG x0,
+    LONG y0,
+    LONG x1,
+    LONG y1,
+    LONG width,
+    LONG height
+) {
+    if (rectangles == nullptr) {
+        return;
+    }
+
+    constexpr int kSegments = 18;
+    constexpr LONG kHalfThickness = 4;
+    for (int segment = 0; segment <= kSegments; ++segment) {
+        const float t = static_cast<float>(segment) / static_cast<float>(kSegments);
+        const LONG x = static_cast<LONG>(x0 + (x1 - x0) * t);
+        const LONG y = static_cast<LONG>(y0 + (y1 - y0) * t);
+        D3D11_RECT rectangle{
+            std::max<LONG>(0, x - kHalfThickness),
+            std::max<LONG>(0, y - kHalfThickness),
+            std::min<LONG>(width, x + kHalfThickness + 1),
+            std::min<LONG>(height, y + kHalfThickness + 1)
+        };
+        if (rectangle.right > rectangle.left && rectangle.bottom > rectangle.top) {
+            rectangles->push_back(rectangle);
+        }
+    }
+}
+
 void drawFixedStereoCube(XrSwapchain swapchain, int64_t imageIndex) {
     ID3D11RenderTargetView* renderTargetView = nullptr;
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t eyeIndex = 0;
+    XrView eyeView{XR_TYPE_VIEW};
+    XrView leftView{XR_TYPE_VIEW};
+    XrView rightView{XR_TYPE_VIEW};
 
     {
         std::lock_guard<std::mutex> lock(gStateMutex);
@@ -673,7 +810,10 @@ void drawFixedStereoCube(XrSwapchain swapchain, int64_t imageIndex) {
         if (
             it == gSwapchainStates.end() ||
             imageIndex < 0 ||
-            static_cast<size_t>(imageIndex) >= it->second.renderTargetViews.size()
+            static_cast<size_t>(imageIndex) >= it->second.renderTargetViews.size() ||
+            gLatestViewCount < 2 ||
+            (gLatestViewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) == 0 ||
+            (gLatestViewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0
         ) {
             return;
         }
@@ -686,7 +826,86 @@ void drawFixedStereoCube(XrSwapchain swapchain, int64_t imageIndex) {
         renderTargetView->AddRef();
         width = it->second.createInfo.width;
         height = it->second.createInfo.height;
-        eyeIndex = it->second.eyeIndex;
+        eyeIndex = std::min<uint32_t>(it->second.eyeIndex, 1);
+        eyeView = gLatestViews[eyeIndex];
+        leftView = gLatestViews[0];
+        rightView = gLatestViews[1];
+    }
+
+    // Build a head pose from the midpoint between both eyes. The left-eye
+    // orientation is a suitable approximation because both views share the
+    // same head orientation in normal stereo configurations.
+    const Vec3 leftPosition{
+        leftView.pose.position.x,
+        leftView.pose.position.y,
+        leftView.pose.position.z
+    };
+    const Vec3 rightPosition{
+        rightView.pose.position.x,
+        rightView.pose.position.y,
+        rightView.pose.position.z
+    };
+    const Vec3 headPosition = scale(add(leftPosition, rightPosition), 0.5f);
+    const Vec3 forward = rotateByQuaternion(leftView.pose.orientation, {0.0f, 0.0f, -1.0f});
+    const Vec3 right = rotateByQuaternion(leftView.pose.orientation, {1.0f, 0.0f, 0.0f});
+    const Vec3 up = rotateByQuaternion(leftView.pose.orientation, {0.0f, 1.0f, 0.0f});
+
+    const Vec3 cubeCenter = add(headPosition, scale(forward, 0.65f));
+    constexpr float kHalfSize = 0.035f;
+    std::array<Vec3, 8> corners{};
+    size_t cornerIndex = 0;
+    for (int z = -1; z <= 1; z += 2) {
+        for (int y = -1; y <= 1; y += 2) {
+            for (int x = -1; x <= 1; x += 2) {
+                corners[cornerIndex++] = add(
+                    cubeCenter,
+                    add(
+                        scale(right, static_cast<float>(x) * kHalfSize),
+                        add(
+                            scale(up, static_cast<float>(y) * kHalfSize),
+                            scale(forward, static_cast<float>(z) * kHalfSize)
+                        )
+                    )
+                );
+            }
+        }
+    }
+
+    std::array<LONG, 8> pixelX{};
+    std::array<LONG, 8> pixelY{};
+    std::array<bool, 8> projected{};
+    for (size_t index = 0; index < corners.size(); ++index) {
+        projected[index] = projectWorldPoint(
+            corners[index], eyeView, width, height, &pixelX[index], &pixelY[index]
+        );
+    }
+
+    static constexpr std::array<std::array<int, 2>, 12> kEdges{{
+        {{0, 1}}, {{0, 2}}, {{0, 4}},
+        {{1, 3}}, {{1, 5}},
+        {{2, 3}}, {{2, 6}},
+        {{3, 7}},
+        {{4, 5}}, {{4, 6}},
+        {{5, 7}}, {{6, 7}}
+    }};
+
+    std::vector<D3D11_RECT> rectangles;
+    rectangles.reserve(kEdges.size() * 19);
+    for (const auto& edge : kEdges) {
+        if (!projected[edge[0]] || !projected[edge[1]]) {
+            continue;
+        }
+        appendLineRectangles(
+            &rectangles,
+            pixelX[edge[0]], pixelY[edge[0]],
+            pixelX[edge[1]], pixelY[edge[1]],
+            static_cast<LONG>(width), static_cast<LONG>(height)
+        );
+    }
+
+    if (rectangles.empty()) {
+        renderTargetView->Release();
+        return;
     }
 
     ID3D11Resource* resource = nullptr;
@@ -724,46 +943,12 @@ void drawFixedStereoCube(XrSwapchain swapchain, int64_t imageIndex) {
         return;
     }
 
-    // A head-locked stereo wireframe cube. The small opposite horizontal
-    // offsets create binocular disparity; the rear square is also shifted
-    // diagonally so the shape reads clearly as a cube.
-    const LONG stereoOffset = eyeIndex == 0 ? 14 : -14;
-    const LONG cx = static_cast<LONG>(width / 2) + stereoOffset;
-    const LONG cy = static_cast<LONG>(height / 2);
-    const LONG halfFront = 105;
-    const LONG depthShift = 42;
-    const LONG thickness = 12;
-
-    const LONG fx0 = cx - halfFront;
-    const LONG fy0 = cy - halfFront;
-    const LONG fx1 = cx + halfFront;
-    const LONG fy1 = cy + halfFront;
-    const LONG bx0 = fx0 + depthShift;
-    const LONG by0 = fy0 - depthShift;
-    const LONG bx1 = fx1 + depthShift;
-    const LONG by1 = fy1 - depthShift;
-
-    const D3D11_RECT rectangles[] = {
-        {fx0, fy0, fx1, fy0 + thickness},
-        {fx0, fy1 - thickness, fx1, fy1},
-        {fx0, fy0, fx0 + thickness, fy1},
-        {fx1 - thickness, fy0, fx1, fy1},
-        {bx0, by0, bx1, by0 + thickness},
-        {bx0, by1 - thickness, bx1, by1},
-        {bx0, by0, bx0 + thickness, by1},
-        {bx1 - thickness, by0, bx1, by1},
-        {fx0, by0, bx0 + thickness, fy0 + thickness},
-        {fx1, by0, bx1 + thickness, fy0 + thickness},
-        {fx0, by1 - thickness, bx0 + thickness, fy1},
-        {fx1, by1 - thickness, bx1 + thickness, fy1}
-    };
-
-    const FLOAT color[4] = {1.0f, 0.05f, 0.75f, 1.0f};
+    const FLOAT color[4] = {0.1f, 1.0f, 0.25f, 1.0f};
     context1->ClearView(
         renderTargetView,
         color,
-        rectangles,
-        static_cast<UINT>(std::size(rectangles))
+        rectangles.data(),
+        static_cast<UINT>(rectangles.size())
     );
 
     context1->Release();
@@ -778,7 +963,7 @@ void drawFixedStereoCube(XrSwapchain swapchain, int64_t imageIndex) {
         }
     }
     if (shouldLog) {
-        logLine("Fixed stereo cube draw submitted successfully");
+        logLine("Stereo-projected fixed cube draw submitted successfully");
     }
 }
 
@@ -1156,6 +1341,68 @@ XRAPI_ATTR XrResult XRAPI_CALL layerLocateHandJointsEXT(
     return result;
 }
 
+XRAPI_ATTR XrResult XRAPI_CALL layerLocateViews(
+    XrSession session,
+    const XrViewLocateInfo* viewLocateInfo,
+    XrViewState* viewState,
+    uint32_t viewCapacityInput,
+    uint32_t* viewCountOutput,
+    XrView* views
+) {
+    PFN_xrLocateViews nextLocateViews = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        nextLocateViews = gNextLocateViews;
+    }
+
+    if (nextLocateViews == nullptr) {
+        logLine("xrLocateViews: downstream function unavailable");
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+
+    const XrResult result = nextLocateViews(
+        session,
+        viewLocateInfo,
+        viewState,
+        viewCapacityInput,
+        viewCountOutput,
+        views
+    );
+
+    if (
+        XR_SUCCEEDED(result) &&
+        viewState != nullptr &&
+        viewCountOutput != nullptr &&
+        views != nullptr &&
+        viewCapacityInput >= 2 &&
+        *viewCountOutput >= 2
+    ) {
+        bool shouldLog = false;
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gLatestViews[0] = views[0];
+            gLatestViews[1] = views[1];
+            gLatestViewCount = 2;
+            gLatestViewStateFlags = viewState->viewStateFlags;
+            if (!gLoggedStereoViewSample) {
+                gLoggedStereoViewSample = true;
+                shouldLog = true;
+            }
+        }
+
+        if (shouldLog) {
+            logLine(
+                std::string("Stereo views captured: count=2, flags=") +
+                std::to_string(static_cast<unsigned long long>(viewState->viewStateFlags)) +
+                ", leftX=" + std::to_string(views[0].pose.position.x) +
+                ", rightX=" + std::to_string(views[1].pose.position.x)
+            );
+        }
+    }
+
+    return result;
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL layerEndFrame(
     XrSession session,
     const XrFrameEndInfo* frameEndInfo
@@ -1256,6 +1503,8 @@ XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
         std::strcmp(name, "xrLocateHandJointsEXT") == 0;
     const bool isEndFrame =
         std::strcmp(name, "xrEndFrame") == 0;
+    const bool isLocateViews =
+        std::strcmp(name, "xrLocateViews") == 0;
     const bool isCreateReferenceSpace =
         std::strcmp(name, "xrCreateReferenceSpace") == 0;
     const bool isDestroySpace =
@@ -1351,6 +1600,24 @@ XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
 
         if (shouldLog) {
             logLine("Intercepting xrLocateHandJointsEXT");
+        }
+    } else if (isLocateViews) {
+        bool shouldLog = false;
+
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gNextLocateViews = reinterpret_cast<PFN_xrLocateViews>(*function);
+
+            if (!gLoggedLocateViewsIntercept) {
+                gLoggedLocateViewsIntercept = true;
+                shouldLog = true;
+            }
+        }
+
+        *function = reinterpret_cast<PFN_xrVoidFunction>(layerLocateViews);
+
+        if (shouldLog) {
+            logLine("Intercepting xrLocateViews");
         }
     } else if (isEndFrame) {
         bool shouldLog = false;
