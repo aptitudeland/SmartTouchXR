@@ -157,6 +157,27 @@ XRAPI_ATTR XrResult XRAPI_CALL layerDestroyInstance(XrInstance instance) {
     return result;
 }
 
+const char* d3dFeatureLevelName(D3D_FEATURE_LEVEL level) {
+    switch (level) {
+        case D3D_FEATURE_LEVEL_11_1:
+            return "11_1";
+        case D3D_FEATURE_LEVEL_11_0:
+            return "11_0";
+        case D3D_FEATURE_LEVEL_10_1:
+            return "10_1";
+        case D3D_FEATURE_LEVEL_10_0:
+            return "10_0";
+        case D3D_FEATURE_LEVEL_9_3:
+            return "9_3";
+        case D3D_FEATURE_LEVEL_9_2:
+            return "9_2";
+        case D3D_FEATURE_LEVEL_9_1:
+            return "9_1";
+        default:
+            return "unknown";
+    }
+}
+
 const char* structureTypeName(XrStructureType type) {
     switch (type) {
         case XR_TYPE_GRAPHICS_BINDING_D3D11_KHR:
@@ -199,6 +220,25 @@ void logSessionCreateChain(const void* next) {
                     std::string("Detected graphics API: D3D11, device=") +
                     (binding->device != nullptr ? "present" : "null")
                 );
+
+                if (binding->device != nullptr) {
+                    const D3D_FEATURE_LEVEL featureLevel =
+                        binding->device->GetFeatureLevel();
+
+                    ID3D11DeviceContext* immediateContext = nullptr;
+                    binding->device->GetImmediateContext(&immediateContext);
+
+                    logLine(
+                        std::string("D3D11 render context: featureLevel=") +
+                        d3dFeatureLevelName(featureLevel) +
+                        ", immediateContext=" +
+                        (immediateContext != nullptr ? "present" : "null")
+                    );
+
+                    if (immediateContext != nullptr) {
+                        immediateContext->Release();
+                    }
+                }
                 break;
             }
             case XR_TYPE_GRAPHICS_BINDING_D3D12_KHR: {
@@ -442,6 +482,69 @@ XRAPI_ATTR XrResult XRAPI_CALL layerEnumerateSwapchainImages(
             }
 
             logLine(description);
+
+            if (texture != nullptr) {
+                ID3D11Device* device = nullptr;
+                texture->GetDevice(&device);
+
+                if (device == nullptr) {
+                    logLine(
+                        std::string("D3D11 RTV validation[") +
+                        std::to_string(index) +
+                        "]: device=null"
+                    );
+                    continue;
+                }
+
+                D3D11_TEXTURE2D_DESC textureDesc{};
+                texture->GetDesc(&textureDesc);
+
+                DXGI_FORMAT viewFormat = textureDesc.Format;
+                {
+                    std::lock_guard<std::mutex> lock(gStateMutex);
+                    const auto stateIt = gSwapchainStates.find(swapchain);
+                    if (stateIt != gSwapchainStates.end()) {
+                        viewFormat = static_cast<DXGI_FORMAT>(
+                            stateIt->second.createInfo.format
+                        );
+                    }
+                }
+
+                D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+                rtvDesc.Format = viewFormat;
+                if (textureDesc.ArraySize > 1) {
+                    rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+                    rtvDesc.Texture2DArray.MipSlice = 0;
+                    rtvDesc.Texture2DArray.FirstArraySlice = 0;
+                    rtvDesc.Texture2DArray.ArraySize = textureDesc.ArraySize;
+                } else {
+                    rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                    rtvDesc.Texture2D.MipSlice = 0;
+                }
+
+                ID3D11RenderTargetView* renderTargetView = nullptr;
+                const HRESULT rtvResult = device->CreateRenderTargetView(
+                    texture,
+                    &rtvDesc,
+                    &renderTargetView
+                );
+
+                logLine(
+                    std::string("D3D11 RTV validation[") +
+                    std::to_string(index) +
+                    "]: result=" +
+                    (SUCCEEDED(rtvResult) ? "OK" : "FAILED") +
+                    ", hresult=" +
+                    std::to_string(static_cast<long>(rtvResult)) +
+                    ", viewFormat=" +
+                    std::to_string(static_cast<int>(viewFormat))
+                );
+
+                if (renderTargetView != nullptr) {
+                    renderTargetView->Release();
+                }
+                device->Release();
+            }
         }
     }
 
