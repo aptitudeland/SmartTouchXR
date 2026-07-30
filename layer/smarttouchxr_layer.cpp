@@ -34,6 +34,12 @@ PFN_xrCreateApiLayerInstance gNextCreateApiLayerInstance = nullptr;
 PFN_xrCreateHandTrackerEXT gNextCreateHandTracker = nullptr;
 PFN_xrDestroyHandTrackerEXT gNextDestroyHandTracker = nullptr;
 PFN_xrLocateHandJointsEXT gNextLocateHandJoints = nullptr;
+PFN_xrEndFrame gNextEndFrame = nullptr;
+uint64_t gEndFrameCallCount = 0;
+bool gLoggedCreateHandTrackerIntercept = false;
+bool gLoggedDestroyHandTrackerIntercept = false;
+bool gLoggedLocateHandJointsIntercept = false;
+bool gLoggedEndFrameIntercept = false;
 std::unordered_map<XrInstance, InstanceDispatch> gInstanceDispatch;
 std::unordered_map<XrHandTrackerEXT, HandTrackerDispatch> gHandTrackerDispatch;
 
@@ -326,6 +332,39 @@ XRAPI_ATTR XrResult XRAPI_CALL layerLocateHandJointsEXT(
     return result;
 }
 
+XRAPI_ATTR XrResult XRAPI_CALL layerEndFrame(
+    XrSession session,
+    const XrFrameEndInfo* frameEndInfo
+) {
+    PFN_xrEndFrame nextEndFrame = nullptr;
+    uint64_t callCount = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        nextEndFrame = gNextEndFrame;
+        callCount = ++gEndFrameCallCount;
+    }
+
+    if (nextEndFrame == nullptr) {
+        logLine("xrEndFrame: downstream function unavailable");
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+
+    if (callCount == 1 || callCount % 300 == 0) {
+        const uint32_t layerCount =
+            frameEndInfo != nullptr ? frameEndInfo->layerCount : 0;
+
+        logLine(
+            std::string("xrEndFrame sample: layerCount=") +
+            std::to_string(layerCount) +
+            ", call=" +
+            std::to_string(callCount)
+        );
+    }
+
+    return nextEndFrame(session, frameEndInfo);
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
     XrInstance instance,
     const char* name,
@@ -378,6 +417,8 @@ XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
         std::strcmp(name, "xrDestroyHandTrackerEXT") == 0;
     const bool isLocateHandJoints =
         std::strcmp(name, "xrLocateHandJointsEXT") == 0;
+    const bool isEndFrame =
+        std::strcmp(name, "xrEndFrame") == 0;
 
     const XrResult result =
         nextGetInstanceProcAddr(instance, name, function);
@@ -397,35 +438,85 @@ XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
     }
 
     if (isCreateHandTracker) {
+        bool shouldLog = false;
+
         {
             std::lock_guard<std::mutex> lock(gStateMutex);
             gNextCreateHandTracker =
                 reinterpret_cast<PFN_xrCreateHandTrackerEXT>(*function);
+
+            if (!gLoggedCreateHandTrackerIntercept) {
+                gLoggedCreateHandTrackerIntercept = true;
+                shouldLog = true;
+            }
         }
 
         *function =
             reinterpret_cast<PFN_xrVoidFunction>(layerCreateHandTrackerEXT);
-        logLine("Intercepting xrCreateHandTrackerEXT");
+
+        if (shouldLog) {
+            logLine("Intercepting xrCreateHandTrackerEXT");
+        }
     } else if (isDestroyHandTracker) {
+        bool shouldLog = false;
+
         {
             std::lock_guard<std::mutex> lock(gStateMutex);
             gNextDestroyHandTracker =
                 reinterpret_cast<PFN_xrDestroyHandTrackerEXT>(*function);
+
+            if (!gLoggedDestroyHandTrackerIntercept) {
+                gLoggedDestroyHandTrackerIntercept = true;
+                shouldLog = true;
+            }
         }
 
         *function =
             reinterpret_cast<PFN_xrVoidFunction>(layerDestroyHandTrackerEXT);
-        logLine("Intercepting xrDestroyHandTrackerEXT");
+
+        if (shouldLog) {
+            logLine("Intercepting xrDestroyHandTrackerEXT");
+        }
     } else if (isLocateHandJoints) {
+        bool shouldLog = false;
+
         {
             std::lock_guard<std::mutex> lock(gStateMutex);
             gNextLocateHandJoints =
                 reinterpret_cast<PFN_xrLocateHandJointsEXT>(*function);
+
+            if (!gLoggedLocateHandJointsIntercept) {
+                gLoggedLocateHandJointsIntercept = true;
+                shouldLog = true;
+            }
         }
 
         *function =
             reinterpret_cast<PFN_xrVoidFunction>(layerLocateHandJointsEXT);
-        logLine("Intercepting xrLocateHandJointsEXT");
+
+        if (shouldLog) {
+            logLine("Intercepting xrLocateHandJointsEXT");
+        }
+    } else if (isEndFrame) {
+        bool shouldLog = false;
+
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gNextEndFrame =
+                reinterpret_cast<PFN_xrEndFrame>(*function);
+
+            if (!gLoggedEndFrameIntercept) {
+                gLoggedEndFrameIntercept = true;
+                shouldLog = true;
+            }
+        }
+
+        *function =
+            reinterpret_cast<PFN_xrVoidFunction>(layerEndFrame);
+
+        if (shouldLog) {
+            logLine("Intercepting xrEndFrame");
+        }
     }
 
     return result;
