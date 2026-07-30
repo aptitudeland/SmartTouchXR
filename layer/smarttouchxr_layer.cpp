@@ -36,6 +36,15 @@ struct HandTrackerDispatch {
     bool loggedFirstSuccessfulLocate = false;
 };
 
+struct SwapchainState {
+    XrSwapchainCreateInfo createInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    uint32_t imageCount = 0;
+    uint64_t acquireCallCount = 0;
+    uint64_t waitCallCount = 0;
+    uint64_t releaseCallCount = 0;
+    int64_t lastAcquiredIndex = -1;
+};
+
 std::mutex gStateMutex;
 std::mutex gLogMutex;
 PFN_xrGetInstanceProcAddr gNextGetInstanceProcAddr = nullptr;
@@ -47,6 +56,12 @@ PFN_xrEndFrame gNextEndFrame = nullptr;
 PFN_xrCreateReferenceSpace gNextCreateReferenceSpace = nullptr;
 PFN_xrDestroySpace gNextDestroySpace = nullptr;
 PFN_xrCreateSession gNextCreateSession = nullptr;
+PFN_xrCreateSwapchain gNextCreateSwapchain = nullptr;
+PFN_xrDestroySwapchain gNextDestroySwapchain = nullptr;
+PFN_xrEnumerateSwapchainImages gNextEnumerateSwapchainImages = nullptr;
+PFN_xrAcquireSwapchainImage gNextAcquireSwapchainImage = nullptr;
+PFN_xrWaitSwapchainImage gNextWaitSwapchainImage = nullptr;
+PFN_xrReleaseSwapchainImage gNextReleaseSwapchainImage = nullptr;
 uint64_t gEndFrameCallCount = 0;
 bool gLoggedCreateHandTrackerIntercept = false;
 bool gLoggedDestroyHandTrackerIntercept = false;
@@ -56,9 +71,16 @@ bool gLoggedCreateReferenceSpaceIntercept = false;
 bool gLoggedDestroySpaceIntercept = false;
 bool gLoggedLocateHandJointsRequest = false;
 bool gLoggedCreateSessionIntercept = false;
+bool gLoggedCreateSwapchainIntercept = false;
+bool gLoggedDestroySwapchainIntercept = false;
+bool gLoggedEnumerateSwapchainImagesIntercept = false;
+bool gLoggedAcquireSwapchainImageIntercept = false;
+bool gLoggedWaitSwapchainImageIntercept = false;
+bool gLoggedReleaseSwapchainImageIntercept = false;
 std::unordered_map<XrInstance, InstanceDispatch> gInstanceDispatch;
 std::unordered_map<XrHandTrackerEXT, HandTrackerDispatch> gHandTrackerDispatch;
 std::unordered_map<XrSpace, XrReferenceSpaceType> gReferenceSpaceTypes;
+std::unordered_map<XrSwapchain, SwapchainState> gSwapchainStates;
 
 std::string logPath() {
     char localAppData[MAX_PATH]{};
@@ -252,6 +274,303 @@ XRAPI_ATTR XrResult XRAPI_CALL layerCreateSession(
         )
     );
 
+    return result;
+}
+
+
+std::string swapchainLabel(XrSwapchain swapchain) {
+    return std::to_string(
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(swapchain)
+        )
+    );
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layerCreateSwapchain(
+    XrSession session,
+    const XrSwapchainCreateInfo* createInfo,
+    XrSwapchain* swapchain
+) {
+    PFN_xrCreateSwapchain nextCreateSwapchain = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        nextCreateSwapchain = gNextCreateSwapchain;
+    }
+
+    if (nextCreateSwapchain == nullptr) {
+        logLine("xrCreateSwapchain: downstream function unavailable");
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+
+    const XrResult result = nextCreateSwapchain(session, createInfo, swapchain);
+
+    if (
+        XR_SUCCEEDED(result) &&
+        createInfo != nullptr &&
+        swapchain != nullptr &&
+        *swapchain != XR_NULL_HANDLE
+    ) {
+        SwapchainState state{};
+        state.createInfo = *createInfo;
+        state.createInfo.next = nullptr;
+
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gSwapchainStates[*swapchain] = state;
+        }
+
+        logLine(
+            std::string("Swapchain created: handle=") +
+            swapchainLabel(*swapchain) +
+            ", width=" + std::to_string(createInfo->width) +
+            ", height=" + std::to_string(createInfo->height) +
+            ", arraySize=" + std::to_string(createInfo->arraySize) +
+            ", mipCount=" + std::to_string(createInfo->mipCount) +
+            ", faceCount=" + std::to_string(createInfo->faceCount) +
+            ", sampleCount=" + std::to_string(createInfo->sampleCount) +
+            ", format=" + std::to_string(createInfo->format) +
+            ", usageFlags=" +
+            std::to_string(static_cast<unsigned long long>(createInfo->usageFlags))
+        );
+    } else {
+        logLine(
+            std::string("xrCreateSwapchain result: ") +
+            std::to_string(static_cast<int>(result))
+        );
+    }
+
+    return result;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layerDestroySwapchain(XrSwapchain swapchain) {
+    PFN_xrDestroySwapchain nextDestroySwapchain = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        nextDestroySwapchain = gNextDestroySwapchain;
+    }
+
+    if (nextDestroySwapchain == nullptr) {
+        logLine("xrDestroySwapchain: downstream function unavailable");
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+
+    const std::string label = swapchainLabel(swapchain);
+    const XrResult result = nextDestroySwapchain(swapchain);
+
+    if (XR_SUCCEEDED(result)) {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        gSwapchainStates.erase(swapchain);
+    }
+
+    logLine(
+        std::string("Swapchain destroyed: handle=") + label +
+        ", result=" + std::to_string(static_cast<int>(result))
+    );
+    return result;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layerEnumerateSwapchainImages(
+    XrSwapchain swapchain,
+    uint32_t imageCapacityInput,
+    uint32_t* imageCountOutput,
+    XrSwapchainImageBaseHeader* images
+) {
+    PFN_xrEnumerateSwapchainImages nextEnumerate = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        nextEnumerate = gNextEnumerateSwapchainImages;
+    }
+
+    if (nextEnumerate == nullptr) {
+        logLine("xrEnumerateSwapchainImages: downstream function unavailable");
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+
+    const XrResult result = nextEnumerate(
+        swapchain,
+        imageCapacityInput,
+        imageCountOutput,
+        images
+    );
+
+    const uint32_t count = imageCountOutput != nullptr ? *imageCountOutput : 0;
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        const auto it = gSwapchainStates.find(swapchain);
+        if (it != gSwapchainStates.end()) {
+            it->second.imageCount = count;
+        }
+    }
+
+    logLine(
+        std::string("Swapchain images enumerated: handle=") +
+        swapchainLabel(swapchain) +
+        ", capacity=" + std::to_string(imageCapacityInput) +
+        ", count=" + std::to_string(count) +
+        ", result=" + std::to_string(static_cast<int>(result))
+    );
+
+    if (
+        XR_SUCCEEDED(result) &&
+        images != nullptr &&
+        imageCapacityInput > 0 &&
+        images[0].type == XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR
+    ) {
+        auto* d3dImages =
+            reinterpret_cast<XrSwapchainImageD3D11KHR*>(images);
+        const uint32_t logCount = (std::min)(imageCapacityInput, count);
+
+        for (uint32_t index = 0; index < logCount; ++index) {
+            ID3D11Texture2D* texture = d3dImages[index].texture;
+            std::string description =
+                std::string("D3D11 swapchain image[") +
+                std::to_string(index) +
+                "]: texture=" +
+                (texture != nullptr ? "present" : "null");
+
+            if (texture != nullptr) {
+                D3D11_TEXTURE2D_DESC desc{};
+                texture->GetDesc(&desc);
+                description +=
+                    ", width=" + std::to_string(desc.Width) +
+                    ", height=" + std::to_string(desc.Height) +
+                    ", arraySize=" + std::to_string(desc.ArraySize) +
+                    ", mipLevels=" + std::to_string(desc.MipLevels) +
+                    ", format=" + std::to_string(static_cast<int>(desc.Format)) +
+                    ", sampleCount=" + std::to_string(desc.SampleDesc.Count) +
+                    ", bindFlags=" + std::to_string(desc.BindFlags);
+            }
+
+            logLine(description);
+        }
+    }
+
+    return result;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layerAcquireSwapchainImage(
+    XrSwapchain swapchain,
+    const XrSwapchainImageAcquireInfo* acquireInfo,
+    uint32_t* index
+) {
+    PFN_xrAcquireSwapchainImage nextAcquire = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        nextAcquire = gNextAcquireSwapchainImage;
+    }
+
+    if (nextAcquire == nullptr) {
+        logLine("xrAcquireSwapchainImage: downstream function unavailable");
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+
+    const XrResult result = nextAcquire(swapchain, acquireInfo, index);
+    uint64_t callCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        auto it = gSwapchainStates.find(swapchain);
+        if (it != gSwapchainStates.end()) {
+            callCount = ++it->second.acquireCallCount;
+            if (XR_SUCCEEDED(result) && index != nullptr) {
+                it->second.lastAcquiredIndex = static_cast<int64_t>(*index);
+            }
+        }
+    }
+
+    if (callCount == 1 || (callCount != 0 && callCount % 300 == 0)) {
+        logLine(
+            std::string("Swapchain acquire sample: handle=") +
+            swapchainLabel(swapchain) +
+            ", index=" +
+            (index != nullptr ? std::to_string(*index) : "null") +
+            ", call=" + std::to_string(callCount) +
+            ", result=" + std::to_string(static_cast<int>(result))
+        );
+    }
+    return result;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layerWaitSwapchainImage(
+    XrSwapchain swapchain,
+    const XrSwapchainImageWaitInfo* waitInfo
+) {
+    PFN_xrWaitSwapchainImage nextWait = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        nextWait = gNextWaitSwapchainImage;
+    }
+
+    if (nextWait == nullptr) {
+        logLine("xrWaitSwapchainImage: downstream function unavailable");
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+
+    const XrResult result = nextWait(swapchain, waitInfo);
+    uint64_t callCount = 0;
+    int64_t lastIndex = -1;
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        auto it = gSwapchainStates.find(swapchain);
+        if (it != gSwapchainStates.end()) {
+            callCount = ++it->second.waitCallCount;
+            lastIndex = it->second.lastAcquiredIndex;
+        }
+    }
+
+    if (callCount == 1 || (callCount != 0 && callCount % 300 == 0)) {
+        logLine(
+            std::string("Swapchain wait sample: handle=") +
+            swapchainLabel(swapchain) +
+            ", acquiredIndex=" + std::to_string(lastIndex) +
+            ", call=" + std::to_string(callCount) +
+            ", result=" + std::to_string(static_cast<int>(result))
+        );
+    }
+    return result;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layerReleaseSwapchainImage(
+    XrSwapchain swapchain,
+    const XrSwapchainImageReleaseInfo* releaseInfo
+) {
+    PFN_xrReleaseSwapchainImage nextRelease = nullptr;
+    int64_t lastIndex = -1;
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        nextRelease = gNextReleaseSwapchainImage;
+        const auto it = gSwapchainStates.find(swapchain);
+        if (it != gSwapchainStates.end()) {
+            lastIndex = it->second.lastAcquiredIndex;
+        }
+    }
+
+    if (nextRelease == nullptr) {
+        logLine("xrReleaseSwapchainImage: downstream function unavailable");
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+
+    const XrResult result = nextRelease(swapchain, releaseInfo);
+    uint64_t callCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        auto it = gSwapchainStates.find(swapchain);
+        if (it != gSwapchainStates.end()) {
+            callCount = ++it->second.releaseCallCount;
+            if (XR_SUCCEEDED(result)) {
+                it->second.lastAcquiredIndex = -1;
+            }
+        }
+    }
+
+    if (callCount == 1 || (callCount != 0 && callCount % 300 == 0)) {
+        logLine(
+            std::string("Swapchain release sample: handle=") +
+            swapchainLabel(swapchain) +
+            ", releasedIndex=" + std::to_string(lastIndex) +
+            ", call=" + std::to_string(callCount) +
+            ", result=" + std::to_string(static_cast<int>(result))
+        );
+    }
     return result;
 }
 
@@ -688,6 +1007,18 @@ XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
         std::strcmp(name, "xrDestroySpace") == 0;
     const bool isCreateSession =
         std::strcmp(name, "xrCreateSession") == 0;
+    const bool isCreateSwapchain =
+        std::strcmp(name, "xrCreateSwapchain") == 0;
+    const bool isDestroySwapchain =
+        std::strcmp(name, "xrDestroySwapchain") == 0;
+    const bool isEnumerateSwapchainImages =
+        std::strcmp(name, "xrEnumerateSwapchainImages") == 0;
+    const bool isAcquireSwapchainImage =
+        std::strcmp(name, "xrAcquireSwapchainImage") == 0;
+    const bool isWaitSwapchainImage =
+        std::strcmp(name, "xrWaitSwapchainImage") == 0;
+    const bool isReleaseSwapchainImage =
+        std::strcmp(name, "xrReleaseSwapchainImage") == 0;
 
     const XrResult result =
         nextGetInstanceProcAddr(instance, name, function);
@@ -846,6 +1177,78 @@ XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
         if (shouldLog) {
             logLine("Intercepting xrCreateSession");
         }
+    } else if (isCreateSwapchain) {
+        bool shouldLog = false;
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gNextCreateSwapchain = reinterpret_cast<PFN_xrCreateSwapchain>(*function);
+            if (!gLoggedCreateSwapchainIntercept) {
+                gLoggedCreateSwapchainIntercept = true;
+                shouldLog = true;
+            }
+        }
+        *function = reinterpret_cast<PFN_xrVoidFunction>(layerCreateSwapchain);
+        if (shouldLog) logLine("Intercepting xrCreateSwapchain");
+    } else if (isDestroySwapchain) {
+        bool shouldLog = false;
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gNextDestroySwapchain = reinterpret_cast<PFN_xrDestroySwapchain>(*function);
+            if (!gLoggedDestroySwapchainIntercept) {
+                gLoggedDestroySwapchainIntercept = true;
+                shouldLog = true;
+            }
+        }
+        *function = reinterpret_cast<PFN_xrVoidFunction>(layerDestroySwapchain);
+        if (shouldLog) logLine("Intercepting xrDestroySwapchain");
+    } else if (isEnumerateSwapchainImages) {
+        bool shouldLog = false;
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gNextEnumerateSwapchainImages = reinterpret_cast<PFN_xrEnumerateSwapchainImages>(*function);
+            if (!gLoggedEnumerateSwapchainImagesIntercept) {
+                gLoggedEnumerateSwapchainImagesIntercept = true;
+                shouldLog = true;
+            }
+        }
+        *function = reinterpret_cast<PFN_xrVoidFunction>(layerEnumerateSwapchainImages);
+        if (shouldLog) logLine("Intercepting xrEnumerateSwapchainImages");
+    } else if (isAcquireSwapchainImage) {
+        bool shouldLog = false;
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gNextAcquireSwapchainImage = reinterpret_cast<PFN_xrAcquireSwapchainImage>(*function);
+            if (!gLoggedAcquireSwapchainImageIntercept) {
+                gLoggedAcquireSwapchainImageIntercept = true;
+                shouldLog = true;
+            }
+        }
+        *function = reinterpret_cast<PFN_xrVoidFunction>(layerAcquireSwapchainImage);
+        if (shouldLog) logLine("Intercepting xrAcquireSwapchainImage");
+    } else if (isWaitSwapchainImage) {
+        bool shouldLog = false;
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gNextWaitSwapchainImage = reinterpret_cast<PFN_xrWaitSwapchainImage>(*function);
+            if (!gLoggedWaitSwapchainImageIntercept) {
+                gLoggedWaitSwapchainImageIntercept = true;
+                shouldLog = true;
+            }
+        }
+        *function = reinterpret_cast<PFN_xrVoidFunction>(layerWaitSwapchainImage);
+        if (shouldLog) logLine("Intercepting xrWaitSwapchainImage");
+    } else if (isReleaseSwapchainImage) {
+        bool shouldLog = false;
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gNextReleaseSwapchainImage = reinterpret_cast<PFN_xrReleaseSwapchainImage>(*function);
+            if (!gLoggedReleaseSwapchainImageIntercept) {
+                gLoggedReleaseSwapchainImageIntercept = true;
+                shouldLog = true;
+            }
+        }
+        *function = reinterpret_cast<PFN_xrVoidFunction>(layerReleaseSwapchainImage);
+        if (shouldLog) logLine("Intercepting xrReleaseSwapchainImage");
     }
 
     return result;
