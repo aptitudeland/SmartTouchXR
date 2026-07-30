@@ -92,6 +92,10 @@ std::unordered_map<XrSwapchain, SwapchainState> gSwapchainStates;
 uint32_t gNextEyeIndex = 0;
 bool gLoggedIndexTipCubeDraw = false;
 bool gLoggedIndexTipTrackingReady = false;
+bool gProximityTargetInitialized = false;
+XrVector3f gProximityTarget{0.0f, 0.0f, 0.0f};
+bool gIndexInsideProximity = false;
+bool gLoggedProximityRender = false;
 bool gLoggedStereoViewSample = false;
 std::array<XrView, 2> gLatestViews{{
     {XR_TYPE_VIEW},
@@ -697,6 +701,15 @@ Vec3 scale(const Vec3& value, float factor) {
     return {value.x * factor, value.y * factor, value.z * factor};
 }
 
+float distanceBetween(const Vec3& a, const Vec3& b) {
+    const Vec3 delta = subtract(a, b);
+    return std::sqrt(
+        delta.x * delta.x +
+        delta.y * delta.y +
+        delta.z * delta.z
+    );
+}
+
 Vec3 rotateByQuaternion(const XrQuaternionf& q, const Vec3& value) {
     const Vec3 u{q.x, q.y, q.z};
     const float scalar = q.w;
@@ -802,63 +815,21 @@ void appendLineRectangles(
     }
 }
 
-void drawTrackedIndexTipCube(XrSwapchain swapchain, int64_t imageIndex) {
-    ID3D11RenderTargetView* renderTargetView = nullptr;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    uint32_t eyeIndex = 0;
-    XrView eyeView{XR_TYPE_VIEW};
-    XrView leftView{XR_TYPE_VIEW};
-    XrView rightView{XR_TYPE_VIEW};
-    XrVector3f rightIndexTip{0.0f, 0.0f, 0.0f};
-
-    {
-        std::lock_guard<std::mutex> lock(gStateMutex);
-        const auto it = gSwapchainStates.find(swapchain);
-        if (
-            it == gSwapchainStates.end() ||
-            imageIndex < 0 ||
-            static_cast<size_t>(imageIndex) >= it->second.renderTargetViews.size() ||
-            gLatestViewCount < 2 ||
-            (gLatestViewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) == 0 ||
-            (gLatestViewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0 ||
-            !gLatestRightIndexValid ||
-            gLatestViewSpace == XR_NULL_HANDLE ||
-            gLatestRightIndexBaseSpace != gLatestViewSpace
-        ) {
-            return;
-        }
-
-        renderTargetView = it->second.renderTargetViews[static_cast<size_t>(imageIndex)];
-        if (renderTargetView == nullptr) {
-            return;
-        }
-
-        renderTargetView->AddRef();
-        width = it->second.createInfo.width;
-        height = it->second.createInfo.height;
-        eyeIndex = std::min<uint32_t>(it->second.eyeIndex, 1);
-        eyeView = gLatestViews[eyeIndex];
-        leftView = gLatestViews[0];
-        rightView = gLatestViews[1];
-        rightIndexTip = gLatestRightIndexTip;
+void appendProjectedCubeRectangles(
+    const Vec3& cubeCenter,
+    float halfSize,
+    const Vec3& right,
+    const Vec3& up,
+    const Vec3& forward,
+    const XrView& eyeView,
+    uint32_t width,
+    uint32_t height,
+    std::vector<D3D11_RECT>* rectangles
+) {
+    if (rectangles == nullptr) {
+        return;
     }
 
-    // Use the current head orientation only to orient the small wireframe.
-    // Its center comes directly from the tracked right index fingertip.
-    const Vec3 forward = rotateByQuaternion(leftView.pose.orientation, {0.0f, 0.0f, -1.0f});
-    const Vec3 right = rotateByQuaternion(leftView.pose.orientation, {1.0f, 0.0f, 0.0f});
-    const Vec3 up = rotateByQuaternion(leftView.pose.orientation, {0.0f, 1.0f, 0.0f});
-
-    // The hand joint and the eye views are both expressed in the exact same
-    // OpenXR base space. This lets us project the fingertip directly into each
-    // eye without an additional coordinate conversion.
-    const Vec3 cubeCenter{
-        rightIndexTip.x,
-        rightIndexTip.y,
-        rightIndexTip.z
-    };
-    constexpr float kHalfSize = 0.0125f;
     std::array<Vec3, 8> corners{};
     size_t cornerIndex = 0;
     for (int z = -1; z <= 1; z += 2) {
@@ -867,10 +838,10 @@ void drawTrackedIndexTipCube(XrSwapchain swapchain, int64_t imageIndex) {
                 corners[cornerIndex++] = add(
                     cubeCenter,
                     add(
-                        scale(right, static_cast<float>(x) * kHalfSize),
+                        scale(right, static_cast<float>(x) * halfSize),
                         add(
-                            scale(up, static_cast<float>(y) * kHalfSize),
-                            scale(forward, static_cast<float>(z) * kHalfSize)
+                            scale(up, static_cast<float>(y) * halfSize),
+                            scale(forward, static_cast<float>(z) * halfSize)
                         )
                     )
                 );
@@ -896,21 +867,176 @@ void drawTrackedIndexTipCube(XrSwapchain swapchain, int64_t imageIndex) {
         {{5, 7}}, {{6, 7}}
     }};
 
-    std::vector<D3D11_RECT> rectangles;
-    rectangles.reserve(kEdges.size() * 19);
     for (const auto& edge : kEdges) {
         if (!projected[edge[0]] || !projected[edge[1]]) {
             continue;
         }
+
         appendLineRectangles(
-            &rectangles,
+            rectangles,
             pixelX[edge[0]], pixelY[edge[0]],
             pixelX[edge[1]], pixelY[edge[1]],
             static_cast<LONG>(width), static_cast<LONG>(height)
         );
     }
+}
 
-    if (rectangles.empty()) {
+void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
+    ID3D11RenderTargetView* renderTargetView = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t eyeIndex = 0;
+    XrView eyeView{XR_TYPE_VIEW};
+    XrView leftView{XR_TYPE_VIEW};
+    XrView rightView{XR_TYPE_VIEW};
+    XrVector3f rightIndexTip{0.0f, 0.0f, 0.0f};
+    XrVector3f target{0.0f, 0.0f, 0.0f};
+    bool proximityActive = false;
+    bool logTargetInitialization = false;
+    bool logProximityEntered = false;
+    bool logProximityExited = false;
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        const auto it = gSwapchainStates.find(swapchain);
+        if (
+            it == gSwapchainStates.end() ||
+            imageIndex < 0 ||
+            static_cast<size_t>(imageIndex) >= it->second.renderTargetViews.size() ||
+            gLatestViewCount < 2 ||
+            (gLatestViewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) == 0 ||
+            (gLatestViewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0 ||
+            !gLatestRightIndexValid ||
+            gLatestViewSpace == XR_NULL_HANDLE ||
+            gLatestRightIndexBaseSpace != gLatestViewSpace
+        ) {
+            return;
+        }
+
+        renderTargetView = it->second.renderTargetViews[static_cast<size_t>(imageIndex)];
+        if (renderTargetView == nullptr) {
+            return;
+        }
+
+        width = it->second.createInfo.width;
+        height = it->second.createInfo.height;
+        eyeIndex = std::min<uint32_t>(it->second.eyeIndex, 1);
+        eyeView = gLatestViews[eyeIndex];
+        leftView = gLatestViews[0];
+        rightView = gLatestViews[1];
+        rightIndexTip = gLatestRightIndexTip;
+
+        if (!gProximityTargetInitialized) {
+            const Vec3 leftEye{
+                leftView.pose.position.x,
+                leftView.pose.position.y,
+                leftView.pose.position.z
+            };
+            const Vec3 rightEye{
+                rightView.pose.position.x,
+                rightView.pose.position.y,
+                rightView.pose.position.z
+            };
+            const Vec3 headCenter = scale(add(leftEye, rightEye), 0.5f);
+            const Vec3 initialForward =
+                rotateByQuaternion(leftView.pose.orientation, {0.0f, 0.0f, -1.0f});
+            const Vec3 initialUp =
+                rotateByQuaternion(leftView.pose.orientation, {0.0f, 1.0f, 0.0f});
+
+            // A world-locked target initialized 55 cm in front of the head and
+            // 8 cm lower. It remains fixed in LOCAL space after initialization.
+            const Vec3 initializedTarget = add(
+                add(headCenter, scale(initialForward, 0.55f)),
+                scale(initialUp, -0.08f)
+            );
+            gProximityTarget = {
+                initializedTarget.x,
+                initializedTarget.y,
+                initializedTarget.z
+            };
+            gProximityTargetInitialized = true;
+            logTargetInitialization = true;
+        }
+
+        target = gProximityTarget;
+        const Vec3 fingertip{
+            rightIndexTip.x,
+            rightIndexTip.y,
+            rightIndexTip.z
+        };
+        const Vec3 targetPoint{target.x, target.y, target.z};
+        constexpr float kActivationRadius = 0.05f;
+        proximityActive =
+            distanceBetween(fingertip, targetPoint) <= kActivationRadius;
+
+        if (proximityActive != gIndexInsideProximity) {
+            gIndexInsideProximity = proximityActive;
+            logProximityEntered = proximityActive;
+            logProximityExited = !proximityActive;
+        }
+
+        renderTargetView->AddRef();
+    }
+
+    if (logTargetInitialization) {
+        logLine(
+            std::string("Virtual proximity target initialized in LOCAL space: x=") +
+            std::to_string(target.x) +
+            ", y=" + std::to_string(target.y) +
+            ", z=" + std::to_string(target.z) +
+            ", activationRadius=0.050000"
+        );
+    }
+    if (logProximityEntered) {
+        logLine("Right index entered virtual proximity target");
+    }
+    if (logProximityExited) {
+        logLine("Right index exited virtual proximity target");
+    }
+
+    const Vec3 forward =
+        rotateByQuaternion(leftView.pose.orientation, {0.0f, 0.0f, -1.0f});
+    const Vec3 right =
+        rotateByQuaternion(leftView.pose.orientation, {1.0f, 0.0f, 0.0f});
+    const Vec3 up =
+        rotateByQuaternion(leftView.pose.orientation, {0.0f, 1.0f, 0.0f});
+
+    const Vec3 fingertipCenter{
+        rightIndexTip.x,
+        rightIndexTip.y,
+        rightIndexTip.z
+    };
+    const Vec3 targetCenter{target.x, target.y, target.z};
+
+    std::vector<D3D11_RECT> fingertipRectangles;
+    std::vector<D3D11_RECT> targetRectangles;
+    fingertipRectangles.reserve(12 * 19);
+    targetRectangles.reserve(12 * 19);
+
+    appendProjectedCubeRectangles(
+        fingertipCenter,
+        0.0125f,
+        right,
+        up,
+        forward,
+        eyeView,
+        width,
+        height,
+        &fingertipRectangles
+    );
+    appendProjectedCubeRectangles(
+        targetCenter,
+        0.025f,
+        right,
+        up,
+        forward,
+        eyeView,
+        width,
+        height,
+        &targetRectangles
+    );
+
+    if (fingertipRectangles.empty() && targetRectangles.empty()) {
         renderTargetView->Release();
         return;
     }
@@ -950,13 +1076,27 @@ void drawTrackedIndexTipCube(XrSwapchain swapchain, int64_t imageIndex) {
         return;
     }
 
-    const FLOAT color[4] = {0.1f, 1.0f, 0.25f, 1.0f};
-    context1->ClearView(
-        renderTargetView,
-        color,
-        rectangles.data(),
-        static_cast<UINT>(rectangles.size())
-    );
+    const FLOAT fingertipColor[4] = {0.15f, 0.75f, 1.0f, 1.0f};
+    const FLOAT targetIdleColor[4] = {1.0f, 0.35f, 0.05f, 1.0f};
+    const FLOAT targetActiveColor[4] = {0.15f, 1.0f, 0.20f, 1.0f};
+
+    if (!targetRectangles.empty()) {
+        context1->ClearView(
+            renderTargetView,
+            proximityActive ? targetActiveColor : targetIdleColor,
+            targetRectangles.data(),
+            static_cast<UINT>(targetRectangles.size())
+        );
+    }
+
+    if (!fingertipRectangles.empty()) {
+        context1->ClearView(
+            renderTargetView,
+            fingertipColor,
+            fingertipRectangles.data(),
+            static_cast<UINT>(fingertipRectangles.size())
+        );
+    }
 
     context1->Release();
     renderTargetView->Release();
@@ -964,13 +1104,13 @@ void drawTrackedIndexTipCube(XrSwapchain swapchain, int64_t imageIndex) {
     bool shouldLog = false;
     {
         std::lock_guard<std::mutex> lock(gStateMutex);
-        if (!gLoggedIndexTipCubeDraw) {
-            gLoggedIndexTipCubeDraw = true;
+        if (!gLoggedProximityRender) {
+            gLoggedProximityRender = true;
             shouldLog = true;
         }
     }
     if (shouldLog) {
-        logLine("Stereo-projected right index-tip cube draw submitted successfully");
+        logLine("Virtual cockpit-proximity prototype rendering successfully");
     }
 }
 
@@ -994,7 +1134,7 @@ XRAPI_ATTR XrResult XRAPI_CALL layerReleaseSwapchainImage(
         return XR_ERROR_FUNCTION_UNSUPPORTED;
     }
 
-    drawTrackedIndexTipCube(swapchain, lastIndex);
+    drawProximityPrototype(swapchain, lastIndex);
 
     const XrResult result = nextRelease(swapchain, releaseInfo);
     uint64_t callCount = 0;
