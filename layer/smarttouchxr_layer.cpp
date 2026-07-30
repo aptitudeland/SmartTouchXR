@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <unknwn.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <d3d12.h>
 #include <GL/gl.h>
 
@@ -18,6 +19,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -39,10 +41,12 @@ struct HandTrackerDispatch {
 struct SwapchainState {
     XrSwapchainCreateInfo createInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     uint32_t imageCount = 0;
+    uint32_t eyeIndex = 0;
     uint64_t acquireCallCount = 0;
     uint64_t waitCallCount = 0;
     uint64_t releaseCallCount = 0;
     int64_t lastAcquiredIndex = -1;
+    std::vector<ID3D11RenderTargetView*> renderTargetViews;
 };
 
 std::mutex gStateMutex;
@@ -81,6 +85,8 @@ std::unordered_map<XrInstance, InstanceDispatch> gInstanceDispatch;
 std::unordered_map<XrHandTrackerEXT, HandTrackerDispatch> gHandTrackerDispatch;
 std::unordered_map<XrSpace, XrReferenceSpaceType> gReferenceSpaceTypes;
 std::unordered_map<XrSwapchain, SwapchainState> gSwapchainStates;
+uint32_t gNextEyeIndex = 0;
+bool gLoggedStereoCubeDraw = false;
 
 std::string logPath() {
     char localAppData[MAX_PATH]{};
@@ -353,6 +359,7 @@ XRAPI_ATTR XrResult XRAPI_CALL layerCreateSwapchain(
         SwapchainState state{};
         state.createInfo = *createInfo;
         state.createInfo.next = nullptr;
+        state.eyeIndex = gNextEyeIndex++ % 2;
 
         {
             std::lock_guard<std::mutex> lock(gStateMutex);
@@ -399,7 +406,15 @@ XRAPI_ATTR XrResult XRAPI_CALL layerDestroySwapchain(XrSwapchain swapchain) {
 
     if (XR_SUCCEEDED(result)) {
         std::lock_guard<std::mutex> lock(gStateMutex);
-        gSwapchainStates.erase(swapchain);
+        const auto it = gSwapchainStates.find(swapchain);
+        if (it != gSwapchainStates.end()) {
+            for (ID3D11RenderTargetView* view : it->second.renderTargetViews) {
+                if (view != nullptr) {
+                    view->Release();
+                }
+            }
+            gSwapchainStates.erase(it);
+        }
     }
 
     logLine(
@@ -541,6 +556,20 @@ XRAPI_ATTR XrResult XRAPI_CALL layerEnumerateSwapchainImages(
                 );
 
                 if (renderTargetView != nullptr) {
+                    std::lock_guard<std::mutex> lock(gStateMutex);
+                    const auto stateIt = gSwapchainStates.find(swapchain);
+                    if (stateIt != gSwapchainStates.end()) {
+                        if (stateIt->second.renderTargetViews.size() < logCount) {
+                            stateIt->second.renderTargetViews.resize(logCount, nullptr);
+                        }
+                        if (stateIt->second.renderTargetViews[index] != nullptr) {
+                            stateIt->second.renderTargetViews[index]->Release();
+                        }
+                        stateIt->second.renderTargetViews[index] = renderTargetView;
+                        renderTargetView = nullptr;
+                    }
+                }
+                if (renderTargetView != nullptr) {
                     renderTargetView->Release();
                 }
                 device->Release();
@@ -632,6 +661,127 @@ XRAPI_ATTR XrResult XRAPI_CALL layerWaitSwapchainImage(
     return result;
 }
 
+void drawFixedStereoCube(XrSwapchain swapchain, int64_t imageIndex) {
+    ID3D11RenderTargetView* renderTargetView = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t eyeIndex = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        const auto it = gSwapchainStates.find(swapchain);
+        if (
+            it == gSwapchainStates.end() ||
+            imageIndex < 0 ||
+            static_cast<size_t>(imageIndex) >= it->second.renderTargetViews.size()
+        ) {
+            return;
+        }
+
+        renderTargetView = it->second.renderTargetViews[static_cast<size_t>(imageIndex)];
+        if (renderTargetView == nullptr) {
+            return;
+        }
+
+        renderTargetView->AddRef();
+        width = it->second.createInfo.width;
+        height = it->second.createInfo.height;
+        eyeIndex = it->second.eyeIndex;
+    }
+
+    ID3D11Resource* resource = nullptr;
+    renderTargetView->GetResource(&resource);
+    if (resource == nullptr) {
+        renderTargetView->Release();
+        return;
+    }
+
+    ID3D11Device* device = nullptr;
+    resource->GetDevice(&device);
+    resource->Release();
+    if (device == nullptr) {
+        renderTargetView->Release();
+        return;
+    }
+
+    ID3D11DeviceContext* context = nullptr;
+    device->GetImmediateContext(&context);
+    device->Release();
+    if (context == nullptr) {
+        renderTargetView->Release();
+        return;
+    }
+
+    ID3D11DeviceContext1* context1 = nullptr;
+    const HRESULT queryResult = context->QueryInterface(
+        __uuidof(ID3D11DeviceContext1),
+        reinterpret_cast<void**>(&context1)
+    );
+    context->Release();
+
+    if (FAILED(queryResult) || context1 == nullptr) {
+        renderTargetView->Release();
+        return;
+    }
+
+    // A head-locked stereo wireframe cube. The small opposite horizontal
+    // offsets create binocular disparity; the rear square is also shifted
+    // diagonally so the shape reads clearly as a cube.
+    const LONG stereoOffset = eyeIndex == 0 ? 14 : -14;
+    const LONG cx = static_cast<LONG>(width / 2) + stereoOffset;
+    const LONG cy = static_cast<LONG>(height / 2);
+    const LONG halfFront = 105;
+    const LONG depthShift = 42;
+    const LONG thickness = 12;
+
+    const LONG fx0 = cx - halfFront;
+    const LONG fy0 = cy - halfFront;
+    const LONG fx1 = cx + halfFront;
+    const LONG fy1 = cy + halfFront;
+    const LONG bx0 = fx0 + depthShift;
+    const LONG by0 = fy0 - depthShift;
+    const LONG bx1 = fx1 + depthShift;
+    const LONG by1 = fy1 - depthShift;
+
+    const D3D11_RECT rectangles[] = {
+        {fx0, fy0, fx1, fy0 + thickness},
+        {fx0, fy1 - thickness, fx1, fy1},
+        {fx0, fy0, fx0 + thickness, fy1},
+        {fx1 - thickness, fy0, fx1, fy1},
+        {bx0, by0, bx1, by0 + thickness},
+        {bx0, by1 - thickness, bx1, by1},
+        {bx0, by0, bx0 + thickness, by1},
+        {bx1 - thickness, by0, bx1, by1},
+        {fx0, by0, bx0 + thickness, fy0 + thickness},
+        {fx1, by0, bx1 + thickness, fy0 + thickness},
+        {fx0, by1 - thickness, bx0 + thickness, fy1},
+        {fx1, by1 - thickness, bx1 + thickness, fy1}
+    };
+
+    const FLOAT color[4] = {1.0f, 0.05f, 0.75f, 1.0f};
+    context1->ClearView(
+        renderTargetView,
+        color,
+        rectangles,
+        static_cast<UINT>(std::size(rectangles))
+    );
+
+    context1->Release();
+    renderTargetView->Release();
+
+    bool shouldLog = false;
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        if (!gLoggedStereoCubeDraw) {
+            gLoggedStereoCubeDraw = true;
+            shouldLog = true;
+        }
+    }
+    if (shouldLog) {
+        logLine("Fixed stereo cube draw submitted successfully");
+    }
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL layerReleaseSwapchainImage(
     XrSwapchain swapchain,
     const XrSwapchainImageReleaseInfo* releaseInfo
@@ -651,6 +801,8 @@ XRAPI_ATTR XrResult XRAPI_CALL layerReleaseSwapchainImage(
         logLine("xrReleaseSwapchainImage: downstream function unavailable");
         return XR_ERROR_FUNCTION_UNSUPPORTED;
     }
+
+    drawFixedStereoCube(swapchain, lastIndex);
 
     const XrResult result = nextRelease(swapchain, releaseInfo);
     uint64_t callCount = 0;
