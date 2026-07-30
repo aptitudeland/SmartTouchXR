@@ -33,6 +33,19 @@ The project is developed incrementally:
 
 Early prototype.
 
-## Export du point d'entrée OpenXR
+## Instance dispatch validation step
 
-La DLL doit exporter exactement `xrNegotiateLoaderApiLayerInterface`. Le projet utilise à la fois `__declspec(dllexport)` et `SmartTouchXR.def`, puis `build.ps1` contrôle l'export avec `dumpbin` lorsqu'il est disponible.
+This revision adds only the first per-instance dispatch table and intercepts
+`xrDestroyInstance`. It deliberately does not add hand tracking or rendering.
+
+Expected log after launching and then closing DCS VR:
+
+```text
+SmartTouchXR: OpenXR loader negotiated the layer
+Forwarding OpenXR instance creation
+OpenXR instance creation result: 0
+Instance dispatch table created
+Forwarding OpenXR instance destruction
+OpenXR instance destruction result: 0
+Instance dispatch table removed
+```
