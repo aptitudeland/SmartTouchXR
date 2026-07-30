@@ -19,11 +19,23 @@ struct InstanceDispatch {
     PFN_xrDestroyInstance destroyInstance = nullptr;
 };
 
+struct HandTrackerDispatch {
+    PFN_xrDestroyHandTrackerEXT destroyHandTracker = nullptr;
+    PFN_xrLocateHandJointsEXT locateHandJoints = nullptr;
+    XrHandEXT hand = XR_HAND_LEFT_EXT;
+    uint64_t locateCallCount = 0;
+    bool loggedFirstSuccessfulLocate = false;
+};
+
 std::mutex gStateMutex;
 std::mutex gLogMutex;
 PFN_xrGetInstanceProcAddr gNextGetInstanceProcAddr = nullptr;
 PFN_xrCreateApiLayerInstance gNextCreateApiLayerInstance = nullptr;
+PFN_xrCreateHandTrackerEXT gNextCreateHandTracker = nullptr;
+PFN_xrDestroyHandTrackerEXT gNextDestroyHandTracker = nullptr;
+PFN_xrLocateHandJointsEXT gNextLocateHandJoints = nullptr;
 std::unordered_map<XrInstance, InstanceDispatch> gInstanceDispatch;
+std::unordered_map<XrHandTrackerEXT, HandTrackerDispatch> gHandTrackerDispatch;
 
 std::string logPath() {
     char localAppData[MAX_PATH]{};
@@ -100,6 +112,220 @@ XRAPI_ATTR XrResult XRAPI_CALL layerDestroyInstance(XrInstance instance) {
     return result;
 }
 
+const char* handName(XrHandEXT hand) {
+    switch (hand) {
+        case XR_HAND_LEFT_EXT:
+            return "left";
+        case XR_HAND_RIGHT_EXT:
+            return "right";
+        default:
+            return "unknown";
+    }
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layerCreateHandTrackerEXT(
+    XrSession session,
+    const XrHandTrackerCreateInfoEXT* createInfo,
+    XrHandTrackerEXT* handTracker
+) {
+    PFN_xrCreateHandTrackerEXT nextCreateHandTracker = nullptr;
+    PFN_xrDestroyHandTrackerEXT nextDestroyHandTracker = nullptr;
+    PFN_xrLocateHandJointsEXT nextLocateHandJoints = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        nextCreateHandTracker = gNextCreateHandTracker;
+        nextDestroyHandTracker = gNextDestroyHandTracker;
+        nextLocateHandJoints = gNextLocateHandJoints;
+    }
+
+    if (nextCreateHandTracker == nullptr) {
+        logLine("xrCreateHandTrackerEXT: downstream function unavailable");
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+
+    const XrHandEXT requestedHand =
+        createInfo != nullptr ? createInfo->hand : XR_HAND_LEFT_EXT;
+
+    logLine(
+        std::string("Forwarding xrCreateHandTrackerEXT for ") +
+        handName(requestedHand) +
+        " hand"
+    );
+
+    const XrResult result =
+        nextCreateHandTracker(session, createInfo, handTracker);
+
+    logLine(
+        std::string("xrCreateHandTrackerEXT result for ") +
+        handName(requestedHand) +
+        ": " +
+        std::to_string(static_cast<int>(result))
+    );
+
+    if (
+        XR_SUCCEEDED(result) &&
+        handTracker != nullptr &&
+        *handTracker != XR_NULL_HANDLE
+    ) {
+        HandTrackerDispatch dispatch{};
+        dispatch.destroyHandTracker = nextDestroyHandTracker;
+        dispatch.locateHandJoints = nextLocateHandJoints;
+        dispatch.hand = requestedHand;
+
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        gHandTrackerDispatch[*handTracker] = dispatch;
+
+        logLine(
+            std::string("Hand tracker dispatch table created for ") +
+            handName(requestedHand) +
+            " hand"
+        );
+    }
+
+    return result;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layerDestroyHandTrackerEXT(
+    XrHandTrackerEXT handTracker
+) {
+    HandTrackerDispatch dispatch{};
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        const auto iterator = gHandTrackerDispatch.find(handTracker);
+        if (iterator != gHandTrackerDispatch.end()) {
+            dispatch = iterator->second;
+        }
+    }
+
+    if (dispatch.destroyHandTracker == nullptr) {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        dispatch.destroyHandTracker = gNextDestroyHandTracker;
+    }
+
+    if (dispatch.destroyHandTracker == nullptr) {
+        logLine("xrDestroyHandTrackerEXT: downstream function unavailable");
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+
+    logLine(
+        std::string("Forwarding xrDestroyHandTrackerEXT for ") +
+        handName(dispatch.hand) +
+        " hand"
+    );
+
+    const XrResult result = dispatch.destroyHandTracker(handTracker);
+
+    logLine(
+        std::string("xrDestroyHandTrackerEXT result: ") +
+        std::to_string(static_cast<int>(result))
+    );
+
+    if (XR_SUCCEEDED(result)) {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        gHandTrackerDispatch.erase(handTracker);
+        logLine("Hand tracker dispatch table removed");
+    }
+
+    return result;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL layerLocateHandJointsEXT(
+    XrHandTrackerEXT handTracker,
+    const XrHandJointsLocateInfoEXT* locateInfo,
+    XrHandJointLocationsEXT* locations
+) {
+    HandTrackerDispatch dispatch{};
+    uint64_t callCount = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        const auto iterator = gHandTrackerDispatch.find(handTracker);
+        if (iterator != gHandTrackerDispatch.end()) {
+            dispatch = iterator->second;
+            callCount = ++iterator->second.locateCallCount;
+        }
+    }
+
+    if (dispatch.locateHandJoints == nullptr) {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        dispatch.locateHandJoints = gNextLocateHandJoints;
+    }
+
+    if (dispatch.locateHandJoints == nullptr) {
+        logLine("xrLocateHandJointsEXT: downstream function unavailable");
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+
+    const XrResult result =
+        dispatch.locateHandJoints(handTracker, locateInfo, locations);
+
+    if (XR_FAILED(result)) {
+        logLine(
+            std::string("xrLocateHandJointsEXT failed for ") +
+            handName(dispatch.hand) +
+            " hand: " +
+            std::to_string(static_cast<int>(result))
+        );
+        return result;
+    }
+
+    bool shouldLog = callCount == 1 || (callCount != 0 && callCount % 300 == 0);
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        const auto iterator = gHandTrackerDispatch.find(handTracker);
+        if (
+            iterator != gHandTrackerDispatch.end() &&
+            !iterator->second.loggedFirstSuccessfulLocate
+        ) {
+            iterator->second.loggedFirstSuccessfulLocate = true;
+            shouldLog = true;
+        }
+    }
+
+    if (shouldLog && locations != nullptr) {
+        logLine(
+            std::string("xrLocateHandJointsEXT sample: hand=") +
+            handName(dispatch.hand) +
+            ", active=" +
+            (locations->isActive == XR_TRUE ? "true" : "false") +
+            ", jointCount=" +
+            std::to_string(locations->jointCount) +
+            ", call=" +
+            std::to_string(callCount)
+        );
+
+        const uint32_t indexTip =
+            static_cast<uint32_t>(XR_HAND_JOINT_INDEX_TIP_EXT);
+
+        if (
+            locations->isActive == XR_TRUE &&
+            locations->jointLocations != nullptr &&
+            locations->jointCount > indexTip
+        ) {
+            const XrHandJointLocationEXT& joint =
+                locations->jointLocations[indexTip];
+
+            logLine(
+                std::string("Index tip position: x=") +
+                std::to_string(joint.pose.position.x) +
+                ", y=" +
+                std::to_string(joint.pose.position.y) +
+                ", z=" +
+                std::to_string(joint.pose.position.z) +
+                ", flags=" +
+                std::to_string(
+                    static_cast<unsigned long long>(joint.locationFlags)
+                )
+            );
+        }
+    }
+
+    return result;
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
     XrInstance instance,
     const char* name,
@@ -146,7 +372,15 @@ XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
         return XR_ERROR_FUNCTION_UNSUPPORTED;
     }
 
-    const XrResult result = nextGetInstanceProcAddr(instance, name, function);
+    const bool isCreateHandTracker =
+        std::strcmp(name, "xrCreateHandTrackerEXT") == 0;
+    const bool isDestroyHandTracker =
+        std::strcmp(name, "xrDestroyHandTrackerEXT") == 0;
+    const bool isLocateHandJoints =
+        std::strcmp(name, "xrLocateHandJointsEXT") == 0;
+
+    const XrResult result =
+        nextGetInstanceProcAddr(instance, name, function);
 
     if (XR_FAILED(result)) {
         logLine(
@@ -155,6 +389,43 @@ XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
             ": " +
             std::to_string(static_cast<int>(result))
         );
+        return result;
+    }
+
+    if (*function == nullptr) {
+        return result;
+    }
+
+    if (isCreateHandTracker) {
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gNextCreateHandTracker =
+                reinterpret_cast<PFN_xrCreateHandTrackerEXT>(*function);
+        }
+
+        *function =
+            reinterpret_cast<PFN_xrVoidFunction>(layerCreateHandTrackerEXT);
+        logLine("Intercepting xrCreateHandTrackerEXT");
+    } else if (isDestroyHandTracker) {
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gNextDestroyHandTracker =
+                reinterpret_cast<PFN_xrDestroyHandTrackerEXT>(*function);
+        }
+
+        *function =
+            reinterpret_cast<PFN_xrVoidFunction>(layerDestroyHandTrackerEXT);
+        logLine("Intercepting xrDestroyHandTrackerEXT");
+    } else if (isLocateHandJoints) {
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gNextLocateHandJoints =
+                reinterpret_cast<PFN_xrLocateHandJointsEXT>(*function);
+        }
+
+        *function =
+            reinterpret_cast<PFN_xrVoidFunction>(layerLocateHandJointsEXT);
+        logLine("Intercepting xrLocateHandJointsEXT");
     }
 
     return result;
