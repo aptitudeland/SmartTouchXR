@@ -13,7 +13,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Compilation failed with exit code $LASTEXITCODE."
 }
 
-$Dll = Join-Path $Build "Release\DCSHandAssistHelloLayer.dll"
+$Dll = Join-Path $Build "Release\SmartTouchXR.dll"
 
 if (!(Test-Path $Dll)) {
     throw "The DLL was not created: $Dll"

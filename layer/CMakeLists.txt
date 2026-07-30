@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(DCSHandAssistHelloLayer LANGUAGES CXX)
+project(SmartTouchXR LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,23 +15,23 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(OpenXRSDK)
 
-add_library(DCSHandAssistHelloLayer SHARED handassist_hello_layer.cpp)
+add_library(SmartTouchXR SHARED smarttouchxr_layer.cpp)
 
 target_link_libraries(
-    DCSHandAssistHelloLayer
+    SmartTouchXR
     PRIVATE
     OpenXR::headers
 )
 
 target_compile_definitions(
-    DCSHandAssistHelloLayer
+    SmartTouchXR
     PRIVATE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
 )
 
 set_target_properties(
-    DCSHandAssistHelloLayer
+    SmartTouchXR
     PROPERTIES
-    OUTPUT_NAME "DCSHandAssistHelloLayer"
+    OUTPUT_NAME "SmartTouchXR"
 )

@@ -11,7 +11,7 @@
 
 namespace {
 
-constexpr const char* kLayerName = "XR_APILAYER_JBG_DCS_handassist_hello";
+constexpr const char* kLayerName = "XR_APILAYER_JBG_SmartTouchXR";
 
 std::mutex gMutex;
 PFN_xrGetInstanceProcAddr gNextGetInstanceProcAddr = nullptr;
@@ -28,10 +28,10 @@ std::string logPath() {
     std::string directory =
         length > 0 ? std::string(localAppData) : std::string(".");
 
-    directory += "\\DCSHandAssist";
+    directory += "\\SmartTouchXR";
     CreateDirectoryA(directory.c_str(), nullptr);
 
-    return directory + "\\HandAssist-layer.txt";
+    return directory + "\\SmartTouchXR-layer.txt";
 }
 
 void logLine(const std::string& message) {
@@ -148,7 +148,7 @@ XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoaderApiLayerInterface(
     apiLayerRequest->getInstanceProcAddr = layerGetInstanceProcAddr;
     apiLayerRequest->createApiLayerInstance = layerCreateApiLayerInstance;
 
-    logLine("Hello HandAssist: OpenXR loader negotiated the layer");
+    logLine("SmartTouchXR: OpenXR loader negotiated the layer");
 
     return XR_SUCCESS;
 }
