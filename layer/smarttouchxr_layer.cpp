@@ -1507,7 +1507,7 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
     std::vector<D3D11_RECT> fingertipRectangles;
     std::vector<D3D11_RECT> targetRectangles;
     fingertipRectangles.reserve(12 * 19);
-    targetRectangles.reserve(12 * 19);
+    targetRectangles.reserve(9 * 12 * 19);
 
     appendProjectedCubeRectangles(
         fingertipCenter,
@@ -1521,18 +1521,58 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
         height,
         &fingertipRectangles
     );
-    appendProjectedCubeRectangles(
-        targetCenter,
-        0.0125f,
-        1,
-        right,
-        up,
-        forward,
-        eyeView,
-        width,
-        height,
-        &targetRectangles
-    );
+
+    bool calibrationReadyForMarkers = false;
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        calibrationReadyForMarkers = gCalibrationFrameReady;
+    }
+
+    if (calibrationReadyForMarkers) {
+        // Nine independently projected cockpit connectors. Only three of these
+        // were used to fit the transform; the remaining six validate spatial
+        // generalization across the UFC and both MFCDs.
+        static constexpr std::array<Vec3, 9> kCockpitConnectors{{
+            {0.7405973673f, -0.1893186867f,  0.0295004621f},  // Master Caution
+            {0.7397546172f, -0.1867421865f, -0.0041990783f},  // UFC ENTER
+            {0.7297000885f, -0.2159425467f, -0.0223697796f},  // UFC CLR
+            {0.7524973154f, -0.2948178649f, -0.2870004177f},  // Left OSB 1
+            {0.7524973750f, -0.2948178649f, -0.2100002468f},  // Left OSB 5
+            {0.7331519127f, -0.4045305252f, -0.1702503562f},  // Left OSB 10
+            {0.7524974942f, -0.2948176563f,  0.2099997848f},  // Right OSB 1
+            {0.7524974942f, -0.2948176861f,  0.2869997919f},  // Right OSB 5
+            {0.7331521511f, -0.4045309722f,  0.3267496824f}   // Right OSB 10
+        }};
+
+        for (const Vec3& cockpitConnector : kCockpitConnectors) {
+            const Vec3 projected = transformDcsToXr(cockpitConnector);
+            appendProjectedCubeRectangles(
+                projected,
+                0.0090f,
+                1,
+                right,
+                up,
+                forward,
+                eyeView,
+                width,
+                height,
+                &targetRectangles
+            );
+        }
+    } else {
+        appendProjectedCubeRectangles(
+            targetCenter,
+            0.0125f,
+            1,
+            right,
+            up,
+            forward,
+            eyeView,
+            width,
+            height,
+            &targetRectangles
+        );
+    }
 
     if (fingertipRectangles.empty() && targetRectangles.empty()) {
         renderTargetView->Release();
@@ -1620,7 +1660,10 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
         }
     }
     if (shouldLog) {
-        logLine("Three-point DCS calibration prototype rendering successfully");
+        logLine(
+            "Projected cockpit connector validation rendering successfully "
+            "(9 markers after calibration)"
+        );
     }
 }
 
