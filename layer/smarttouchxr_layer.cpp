@@ -1,3 +1,5 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <unknwn.h>
 #include <d3d11.h>
@@ -22,6 +24,10 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <sstream>
+
+
+#pragma comment(lib, "ws2_32.lib")
 
 namespace {
 
@@ -96,6 +102,20 @@ bool gProximityTargetInitialized = false;
 XrVector3f gProximityTarget{0.0f, 0.0f, 0.0f};
 bool gIndexInsideProximity = false;
 bool gLoggedProximityRender = false;
+SOCKET gCalibrationSocket = INVALID_SOCKET;
+bool gWinsockInitialized = false;
+bool gCalibrationSocketReady = false;
+std::array<XrVector3f, 3> gCalibrationPoints{{
+    {0.0f, 0.0f, 0.0f},
+    {0.0f, 0.0f, 0.0f},
+    {0.0f, 0.0f, 0.0f}
+}};
+std::array<bool, 3> gCalibrationPointValid{{false, false, false}};
+bool gCalibrationFrameReady = false;
+XrVector3f gCalibrationOrigin{0.0f, 0.0f, 0.0f};
+XrVector3f gCalibrationAxisX{1.0f, 0.0f, 0.0f};
+XrVector3f gCalibrationAxisY{0.0f, 1.0f, 0.0f};
+XrVector3f gCalibrationAxisZ{0.0f, 0.0f, 1.0f};
 bool gLoggedStereoViewSample = false;
 std::array<XrView, 2> gLatestViews{{
     {XR_TYPE_VIEW},
@@ -710,6 +730,176 @@ float distanceBetween(const Vec3& a, const Vec3& b) {
     );
 }
 
+Vec3 normalize(const Vec3& value) {
+    const float length = std::sqrt(value.x * value.x + value.y * value.y + value.z * value.z);
+    if (length <= 0.000001f) {
+        return {0.0f, 0.0f, 0.0f};
+    }
+    return {value.x / length, value.y / length, value.z / length};
+}
+
+Vec3 cross(const Vec3& a, const Vec3& b) {
+    return {
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    };
+}
+
+std::string calibrationPath() {
+    char localAppData[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableA(
+        "LOCALAPPDATA", localAppData, static_cast<DWORD>(std::size(localAppData))
+    );
+    std::string directory = length > 0 ? std::string(localAppData) : std::string(".");
+    directory += "\\SmartTouchXR";
+    CreateDirectoryA(directory.c_str(), nullptr);
+    return directory + "\\A10CII-three-point-calibration.txt";
+}
+
+void saveCalibrationFrame() {
+    std::ofstream file(calibrationPath(), std::ios::trunc);
+    if (!file) {
+        logLine("Failed to save three-point calibration file");
+        return;
+    }
+    file << "module=A-10C_2\n";
+    file << "origin=" << gCalibrationOrigin.x << ',' << gCalibrationOrigin.y << ',' << gCalibrationOrigin.z << '\n';
+    file << "axis_x=" << gCalibrationAxisX.x << ',' << gCalibrationAxisX.y << ',' << gCalibrationAxisX.z << '\n';
+    file << "axis_y=" << gCalibrationAxisY.x << ',' << gCalibrationAxisY.y << ',' << gCalibrationAxisY.z << '\n';
+    file << "axis_z=" << gCalibrationAxisZ.x << ',' << gCalibrationAxisZ.y << ',' << gCalibrationAxisZ.z << '\n';
+    file << "master_caution=" << gCalibrationPoints[0].x << ',' << gCalibrationPoints[0].y << ',' << gCalibrationPoints[0].z << '\n';
+    file << "left_mfcd_osb1=" << gCalibrationPoints[1].x << ',' << gCalibrationPoints[1].y << ',' << gCalibrationPoints[1].z << '\n';
+    file << "right_mfcd_osb1=" << gCalibrationPoints[2].x << ',' << gCalibrationPoints[2].y << ',' << gCalibrationPoints[2].z << '\n';
+    logLine(std::string("Three-point calibration saved: ") + calibrationPath());
+}
+
+void rebuildCalibrationFrameIfComplete() {
+    if (!gCalibrationPointValid[0] || !gCalibrationPointValid[1] || !gCalibrationPointValid[2]) {
+        return;
+    }
+
+    const Vec3 master{gCalibrationPoints[0].x, gCalibrationPoints[0].y, gCalibrationPoints[0].z};
+    const Vec3 left{gCalibrationPoints[1].x, gCalibrationPoints[1].y, gCalibrationPoints[1].z};
+    const Vec3 right{gCalibrationPoints[2].x, gCalibrationPoints[2].y, gCalibrationPoints[2].z};
+
+    const Vec3 axisX = normalize(subtract(right, left));
+    const Vec3 planeReference = subtract(master, scale(add(left, right), 0.5f));
+    const Vec3 axisZ = normalize(cross(axisX, planeReference));
+    const Vec3 axisY = normalize(cross(axisZ, axisX));
+
+    if (distanceBetween(axisX, {0.0f, 0.0f, 0.0f}) < 0.5f ||
+        distanceBetween(axisY, {0.0f, 0.0f, 0.0f}) < 0.5f ||
+        distanceBetween(axisZ, {0.0f, 0.0f, 0.0f}) < 0.5f) {
+        logLine("Three-point calibration rejected: points are degenerate or nearly aligned");
+        return;
+    }
+
+    gCalibrationOrigin = {master.x, master.y, master.z};
+    gCalibrationAxisX = {axisX.x, axisX.y, axisX.z};
+    gCalibrationAxisY = {axisY.x, axisY.y, axisY.z};
+    gCalibrationAxisZ = {axisZ.x, axisZ.y, axisZ.z};
+    gCalibrationFrameReady = true;
+    gProximityTarget = gCalibrationPoints[0];
+    gProximityTargetInitialized = true;
+    saveCalibrationFrame();
+    logLine("Three-point cockpit calibration complete");
+}
+
+bool initializeCalibrationUdp() {
+    if (gCalibrationSocketReady) {
+        return true;
+    }
+    if (!gWinsockInitialized) {
+        WSADATA data{};
+        if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
+            logLine("UDP calibration: WSAStartup failed");
+            return false;
+        }
+        gWinsockInitialized = true;
+    }
+
+    gCalibrationSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (gCalibrationSocket == INVALID_SOCKET) {
+        logLine("UDP calibration: socket creation failed");
+        return false;
+    }
+
+    u_long nonBlocking = 1;
+    ioctlsocket(gCalibrationSocket, FIONBIO, &nonBlocking);
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(34343);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(gCalibrationSocket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR) {
+        logLine(std::string("UDP calibration: bind failed, WSA error=") + std::to_string(WSAGetLastError()));
+        closesocket(gCalibrationSocket);
+        gCalibrationSocket = INVALID_SOCKET;
+        return false;
+    }
+
+    gCalibrationSocketReady = true;
+    logLine("UDP calibration receiver listening on 127.0.0.1:34343");
+    return true;
+}
+
+int calibrationIndexForMessage(const std::string& message) {
+    if (message.find("MASTER_CAUTION") != std::string::npos) return 0;
+    if (message.find("LEFT_MFCD_OSB1") != std::string::npos) return 1;
+    if (message.find("RIGHT_MFCD_OSB1") != std::string::npos) return 2;
+    return -1;
+}
+
+void pollCalibrationUdp(const XrVector3f& currentIndexTip) {
+    if (!initializeCalibrationUdp()) {
+        return;
+    }
+
+    char buffer[512]{};
+    for (;;) {
+        sockaddr_in sender{};
+        int senderLength = sizeof(sender);
+        const int received = recvfrom(
+            gCalibrationSocket,
+            buffer,
+            static_cast<int>(sizeof(buffer) - 1),
+            0,
+            reinterpret_cast<sockaddr*>(&sender),
+            &senderLength
+        );
+        if (received == SOCKET_ERROR) {
+            const int error = WSAGetLastError();
+            if (error != WSAEWOULDBLOCK) {
+                logLine(std::string("UDP calibration receive error=") + std::to_string(error));
+            }
+            break;
+        }
+        if (received <= 0) break;
+
+        buffer[received] = '\0';
+        const std::string message(buffer, static_cast<size_t>(received));
+        const int index = calibrationIndexForMessage(message);
+        if (index < 0) {
+            logLine(std::string("UDP calibration ignored message: ") + message);
+            continue;
+        }
+
+        gCalibrationPoints[static_cast<size_t>(index)] = currentIndexTip;
+        gCalibrationPointValid[static_cast<size_t>(index)] = true;
+        static constexpr const char* kNames[3] = {
+            "MASTER_CAUTION", "LEFT_MFCD_OSB1", "RIGHT_MFCD_OSB1"
+        };
+        logLine(
+            std::string("Captured calibration point ") + kNames[index] +
+            ": x=" + std::to_string(currentIndexTip.x) +
+            ", y=" + std::to_string(currentIndexTip.y) +
+            ", z=" + std::to_string(currentIndexTip.z)
+        );
+        rebuildCalibrationFrameIfComplete();
+    }
+}
+
 Vec3 rotateByQuaternion(const XrQuaternionf& q, const Vec3& value) {
     const Vec3 u{q.x, q.y, q.z};
     const float scalar = q.w;
@@ -958,6 +1148,12 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
             logTargetInitialization = true;
         }
 
+        pollCalibrationUdp(rightIndexTip);
+        if (gCalibrationPointValid[0]) {
+            gProximityTarget = gCalibrationPoints[0];
+            gProximityTargetInitialized = true;
+        }
+
         target = gProximityTarget;
         const Vec3 fingertip{
             rightIndexTip.x,
@@ -980,18 +1176,19 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
 
     if (logTargetInitialization) {
         logLine(
-            std::string("Virtual proximity target initialized in LOCAL space: x=") +
+            std::string("Master Caution calibration target initialized in LOCAL space: x=") +
             std::to_string(target.x) +
             ", y=" + std::to_string(target.y) +
             ", z=" + std::to_string(target.z) +
             ", activationRadius=0.050000"
         );
+        logLine("Waiting for DCS three-point calibration events over UDP");
     }
     if (logProximityEntered) {
-        logLine("Right index entered virtual proximity target");
+        logLine("Right index entered Master Caution proximity target");
     }
     if (logProximityExited) {
-        logLine("Right index exited virtual proximity target");
+        logLine("Right index exited Master Caution proximity target");
     }
 
     const Vec3 forward =
@@ -1110,7 +1307,7 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
         }
     }
     if (shouldLog) {
-        logLine("Virtual cockpit-proximity prototype rendering successfully");
+        logLine("Three-point DCS calibration prototype rendering successfully");
     }
 }
 
