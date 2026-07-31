@@ -1,6 +1,14 @@
--- SmartTouchXR diagnostic bridge for DCS World
--- Repeats diagnostics after cockpit initialization so UDP messages are not lost
--- if the OpenXR layer starts listening after Export.lua is loaded.
+-- SmartTouchXR three-point cockpit calibration bridge
+-- A-10C II verified cockpit arguments:
+--   MASTER_CAUTION  = 403
+--   LEFT_MFCD_OSB1  = 300
+--   RIGHT_MFCD_OSB1 = 326
+--
+-- Loaded by:
+-- C:\Users\<user>\Saved Games\DCS.openbeta\Scripts\Export.lua
+--
+-- The script watches only these three main-panel arguments and sends one UDP
+-- calibration event on each rising edge.
 
 local socket = require("socket")
 
@@ -14,78 +22,90 @@ local function send(message)
     end
 end
 
+local CONFIG = {
+    MASTER_CAUTION = 403,
+    LEFT_MFCD_OSB1 = 300,
+    RIGHT_MFCD_OSB1 = 326,
+}
+
+local previous = {
+    MASTER_CAUTION = nil,
+    LEFT_MFCD_OSB1 = nil,
+    RIGHT_MFCD_OSB1 = nil,
+}
+
+local mainPanel = nil
 local frameCount = 0
-local lastReportedDevicesSource = nil
-local lastReportedDeviceValues = {}
+local initialized = false
+local lastHeartbeatFrame = 0
 
-local function loadDevices()
-    if type(_G.devices) == "table" then
-        return _G.devices, "global"
+local function getMainPanel()
+    if mainPanel then
+        return mainPanel
     end
 
-    if not LockOn_Options or not LockOn_Options.script_path then
-        return nil, "no_script_path"
+    local ok, device = pcall(GetDevice, 0)
+    if ok and device then
+        mainPanel = device
     end
 
-    local ok, result = pcall(
-        dofile,
-        LockOn_Options.script_path .. "devices.lua"
-    )
-
-    if not ok then
-        return nil, "devices_lua_error"
-    end
-
-    if type(result) == "table" then
-        return result, "return_value"
-    end
-
-    if type(_G.devices) == "table" then
-        return _G.devices, "global_after_dofile"
-    end
-
-    return nil, "unavailable"
+    return mainPanel
 end
 
-local function reportDevice(name, value)
-    local encoded = value ~= nil and tostring(value) or "MISSING"
+local function readArgument(argument)
+    local device = getMainPanel()
+    if not device then
+        return nil
+    end
 
-    if lastReportedDeviceValues[name] == encoded then
+    local ok, value = pcall(
+        device.get_argument_value,
+        device,
+        argument
+    )
+
+    if not ok or type(value) ~= "number" then
+        return nil
+    end
+
+    return value
+end
+
+local function initializeState()
+    local allAvailable = true
+
+    for name, argument in pairs(CONFIG) do
+        local value = readArgument(argument)
+
+        if value == nil then
+            allAvailable = false
+        else
+            previous[name] = value
+        end
+    end
+
+    if allAvailable then
+        initialized = true
+        send("SMARTTOUCHXR_CALIBRATION_READY")
+    end
+end
+
+local function checkRisingEdge(name, argument)
+    local value = readArgument(argument)
+    if value == nil then
         return
     end
 
-    lastReportedDeviceValues[name] = encoded
+    local oldValue = previous[name]
 
-    if value ~= nil then
-        send("SMARTTOUCHXR_DEVICE_AVAILABLE;" .. name .. ";" .. encoded)
-    else
-        send("SMARTTOUCHXR_DEVICE_MISSING;" .. name)
+    if oldValue ~= nil and value > 0.5 and oldValue <= 0.5 then
+        send("CALIBRATE;" .. name)
     end
+
+    previous[name] = value
 end
 
-local function reportDiagnostics()
-    local devices, source = loadDevices()
-
-    if source ~= lastReportedDevicesSource then
-        lastReportedDevicesSource = source
-        send("SMARTTOUCHXR_DEVICES_SOURCE;" .. source)
-    end
-
-    if devices then
-        reportDevice("MFCD_LEFT", devices.MFCD_LEFT)
-        reportDevice("MFCD_RIGHT", devices.MFCD_RIGHT)
-        reportDevice("UFC", devices.UFC)
-        reportDevice("CDU", devices.CDU)
-    else
-        reportDevice("MFCD_LEFT", nil)
-        reportDevice("MFCD_RIGHT", nil)
-        reportDevice("UFC", nil)
-        reportDevice("CDU", nil)
-    end
-end
-
--- This message may be sent before the OpenXR layer begins listening.
-send("SMARTTOUCHXR_LUA_LOADED")
+send("SMARTTOUCHXR_CALIBRATION_SCRIPT_LOADED")
 
 local previousAfterNextFrame = LuaExportAfterNextFrame
 
@@ -96,23 +116,25 @@ LuaExportAfterNextFrame = function()
 
     frameCount = frameCount + 1
 
-    if frameCount == 1 then
-        send("SMARTTOUCHXR_FIRST_FRAME")
+    if not initialized then
+        initializeState()
+        return
     end
 
-    -- Repeat a heartbeat and device probe every 300 export frames.
-    -- This ensures messages arrive after the OpenXR layer starts listening
-    -- and after the A-10C II cockpit devices have initialized.
-    if frameCount % 300 == 0 then
-        send("SMARTTOUCHXR_HEARTBEAT;" .. tostring(frameCount))
-        reportDiagnostics()
+    checkRisingEdge("MASTER_CAUTION", CONFIG.MASTER_CAUTION)
+    checkRisingEdge("LEFT_MFCD_OSB1", CONFIG.LEFT_MFCD_OSB1)
+    checkRisingEdge("RIGHT_MFCD_OSB1", CONFIG.RIGHT_MFCD_OSB1)
+
+    if frameCount - lastHeartbeatFrame >= 600 then
+        lastHeartbeatFrame = frameCount
+        send("SMARTTOUCHXR_CALIBRATION_HEARTBEAT")
     end
 end
 
 local previousStop = LuaExportStop
 
 LuaExportStop = function()
-    send("SMARTTOUCHXR_STOP")
+    send("SMARTTOUCHXR_CALIBRATION_SCRIPT_STOP")
 
     if udp then
         udp:close()
