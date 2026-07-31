@@ -1243,23 +1243,24 @@ void appendLineRectangles(
     LONG x1,
     LONG y1,
     LONG width,
-    LONG height
+    LONG height,
+    LONG halfThickness
 ) {
     if (rectangles == nullptr) {
         return;
     }
 
     constexpr int kSegments = 18;
-    constexpr LONG kHalfThickness = 4;
+    const LONG clampedHalfThickness = std::max<LONG>(1, halfThickness);
     for (int segment = 0; segment <= kSegments; ++segment) {
         const float t = static_cast<float>(segment) / static_cast<float>(kSegments);
         const LONG x = static_cast<LONG>(x0 + (x1 - x0) * t);
         const LONG y = static_cast<LONG>(y0 + (y1 - y0) * t);
         D3D11_RECT rectangle{
-            std::max<LONG>(0, x - kHalfThickness),
-            std::max<LONG>(0, y - kHalfThickness),
-            std::min<LONG>(width, x + kHalfThickness + 1),
-            std::min<LONG>(height, y + kHalfThickness + 1)
+            std::max<LONG>(0, x - clampedHalfThickness),
+            std::max<LONG>(0, y - clampedHalfThickness),
+            std::min<LONG>(width, x + clampedHalfThickness + 1),
+            std::min<LONG>(height, y + clampedHalfThickness + 1)
         };
         if (rectangle.right > rectangle.left && rectangle.bottom > rectangle.top) {
             rectangles->push_back(rectangle);
@@ -1270,6 +1271,7 @@ void appendLineRectangles(
 void appendProjectedCubeRectangles(
     const Vec3& cubeCenter,
     float halfSize,
+    LONG halfThickness,
     const Vec3& right,
     const Vec3& up,
     const Vec3& forward,
@@ -1328,7 +1330,8 @@ void appendProjectedCubeRectangles(
             rectangles,
             pixelX[edge[0]], pixelY[edge[0]],
             pixelX[edge[1]], pixelY[edge[1]],
-            static_cast<LONG>(width), static_cast<LONG>(height)
+            static_cast<LONG>(width), static_cast<LONG>(height),
+            halfThickness
         );
     }
 }
@@ -1411,7 +1414,12 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
         }
 
         pollCalibrationUdp(rightIndexTip);
-        if (gCalibrationPointValid[0]) {
+
+        // Before the three-point transform is complete, show the captured
+        // Master Caution point as a temporary calibration reference. Once the
+        // transform is ready, rebuildCalibrationFrameIfComplete() owns the
+        // target and places it on the independent UFC ENTER validation point.
+        if (!gCalibrationFrameReady && gCalibrationPointValid[0]) {
             gProximityTarget = gCalibrationPoints[0];
             gProximityTargetInitialized = true;
         }
@@ -1453,12 +1461,41 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
         logLine("Right index exited Master Caution proximity target");
     }
 
-    const Vec3 forward =
-        rotateByQuaternion(leftView.pose.orientation, {0.0f, 0.0f, -1.0f});
-    const Vec3 right =
-        rotateByQuaternion(leftView.pose.orientation, {1.0f, 0.0f, 0.0f});
-    const Vec3 up =
-        rotateByQuaternion(leftView.pose.orientation, {0.0f, 1.0f, 0.0f});
+    Vec3 forward{};
+    Vec3 right{};
+    Vec3 up{};
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+
+        if (gCalibrationFrameReady) {
+            // Use the calibrated cockpit basis. The debug cube now remains
+            // rigidly aligned with the cockpit instead of tilting with the head.
+            right = {
+                gCalibrationAxisZ.x,
+                gCalibrationAxisZ.y,
+                gCalibrationAxisZ.z
+            };
+            up = {
+                gCalibrationAxisY.x,
+                gCalibrationAxisY.y,
+                gCalibrationAxisY.z
+            };
+            forward = scale(
+                {
+                    gCalibrationAxisX.x,
+                    gCalibrationAxisX.y,
+                    gCalibrationAxisX.z
+                },
+                -1.0f
+            );
+        } else {
+            // Temporary pre-calibration reference stays aligned with LOCAL axes.
+            right = {1.0f, 0.0f, 0.0f};
+            up = {0.0f, 1.0f, 0.0f};
+            forward = {0.0f, 0.0f, -1.0f};
+        }
+    }
 
     const Vec3 fingertipCenter{
         rightIndexTip.x,
@@ -1474,7 +1511,8 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
 
     appendProjectedCubeRectangles(
         fingertipCenter,
-        0.0125f,
+        0.0080f,
+        1,
         right,
         up,
         forward,
@@ -1485,7 +1523,8 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
     );
     appendProjectedCubeRectangles(
         targetCenter,
-        0.025f,
+        0.0125f,
+        1,
         right,
         up,
         forward,
@@ -1536,13 +1575,25 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
     }
 
     const FLOAT fingertipColor[4] = {0.15f, 0.75f, 1.0f, 1.0f};
-    const FLOAT targetIdleColor[4] = {1.0f, 0.35f, 0.05f, 1.0f};
+    const FLOAT targetWaitingColor[4] = {1.0f, 0.35f, 0.05f, 1.0f};
+    const FLOAT targetProjectedColor[4] = {0.05f, 0.90f, 1.0f, 1.0f};
     const FLOAT targetActiveColor[4] = {0.15f, 1.0f, 0.20f, 1.0f};
+
+    bool calibrationReady = false;
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        calibrationReady = gCalibrationFrameReady;
+    }
+
+    const FLOAT* targetColor =
+        proximityActive
+            ? targetActiveColor
+            : (calibrationReady ? targetProjectedColor : targetWaitingColor);
 
     if (!targetRectangles.empty()) {
         context1->ClearView(
             renderTargetView,
-            proximityActive ? targetActiveColor : targetIdleColor,
+            targetColor,
             targetRectangles.data(),
             static_cast<UINT>(targetRectangles.size())
         );
