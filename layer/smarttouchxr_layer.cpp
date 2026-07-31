@@ -1024,13 +1024,31 @@ void rebuildCalibrationFrameIfComplete() {
 
     gCalibrationFrameReady = true;
 
-    const Vec3 transformedMaster = transformDcsToXr(dcsPoints[0]);
+    // Fourth validation point: UFC ENTER. This connector was not used by
+    // the three-point fit. If the rendered cube lands on the physical ENTER
+    // key, the cockpit-to-OpenXR transform generalizes beyond calibration.
+    const Vec3 ufcEnterDcs{
+        0.7397546172f,
+        -0.1867421865f,
+        -0.0041990783f
+    };
+    const Vec3 transformedUfcEnter = transformDcsToXr(ufcEnterDcs);
+
     gProximityTarget = {
-        transformedMaster.x,
-        transformedMaster.y,
-        transformedMaster.z
+        transformedUfcEnter.x,
+        transformedUfcEnter.y,
+        transformedUfcEnter.z
     };
     gProximityTargetInitialized = true;
+
+    logLine(
+        std::string("Projected validation target UFC_ENTER: x=") +
+        std::to_string(transformedUfcEnter.x) +
+        ", y=" +
+        std::to_string(transformedUfcEnter.y) +
+        ", z=" +
+        std::to_string(transformedUfcEnter.z)
+    );
 
     saveCalibrationFrame(dcsPoints, predictedXrPoints, pointErrors);
 
