@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -101,6 +102,10 @@ bool gLoggedIndexTipTrackingReady = false;
 bool gProximityTargetInitialized = false;
 XrVector3f gProximityTarget{0.0f, 0.0f, 0.0f};
 bool gIndexInsideProximity = false;
+int gSelectedConnectorIndex = -1;
+bool gSelectedConnectorTouchActive = false;
+float gSelectedConnectorDistanceMeters = 0.0f;
+bool gLoggedCalibrationLockedMessage = false;
 bool gLoggedProximityRender = false;
 SOCKET gCalibrationSocket = INVALID_SOCKET;
 bool gWinsockInitialized = false;
@@ -1053,7 +1058,7 @@ void rebuildCalibrationFrameIfComplete() {
     saveCalibrationFrame(dcsPoints, predictedXrPoints, pointErrors);
 
     logLine(
-        std::string("Three-point rigid transform complete: rmsErrorMm=") +
+        std::string("Three-point rigid transform complete and calibration locked: rmsErrorMm=") +
         std::to_string(gCalibrationRmsErrorMeters * 1000.0f) +
         ", maxErrorMm=" +
         std::to_string(gCalibrationMaxErrorMeters * 1000.0f)
@@ -1144,6 +1149,20 @@ void pollCalibrationUdp(const XrVector3f& currentIndexTip) {
         const int index = calibrationIndexForMessage(message);
         if (index < 0) {
             logLine(std::string("UDP calibration ignored message: ") + message);
+            continue;
+        }
+
+        // The first complete three-point fit defines the session alignment.
+        // Further presses of calibration controls are normal cockpit use and
+        // must not move the entire cockpit transform.
+        if (gCalibrationFrameReady) {
+            if (!gLoggedCalibrationLockedMessage) {
+                logLine(
+                    "Calibration locked for this OpenXR session; "
+                    "subsequent CALIBRATE events are ignored"
+                );
+                gLoggedCalibrationLockedMessage = true;
+            }
             continue;
         }
 
@@ -1336,6 +1355,82 @@ void appendProjectedCubeRectangles(
     }
 }
 
+
+void appendProjectedWireSphereRectangles(
+    const Vec3& center,
+    float radius,
+    LONG halfThickness,
+    const Vec3& right,
+    const Vec3& up,
+    const Vec3& forward,
+    const XrView& eyeView,
+    uint32_t width,
+    uint32_t height,
+    std::vector<D3D11_RECT>* rectangles
+) {
+    if (rectangles == nullptr) {
+        return;
+    }
+
+    constexpr int kCircleSegments = 24;
+    constexpr float kTwoPi = 6.28318530717958647692f;
+
+    const std::array<std::array<Vec3, 2>, 3> circleAxes{{
+        {{right, up}},
+        {{right, forward}},
+        {{up, forward}}
+    }};
+
+    for (const auto& axes : circleAxes) {
+        for (int segment = 0; segment < kCircleSegments; ++segment) {
+            const float angle0 =
+                kTwoPi * static_cast<float>(segment) /
+                static_cast<float>(kCircleSegments);
+            const float angle1 =
+                kTwoPi * static_cast<float>(segment + 1) /
+                static_cast<float>(kCircleSegments);
+
+            const Vec3 point0 = add(
+                center,
+                add(
+                    scale(axes[0], std::cos(angle0) * radius),
+                    scale(axes[1], std::sin(angle0) * radius)
+                )
+            );
+            const Vec3 point1 = add(
+                center,
+                add(
+                    scale(axes[0], std::cos(angle1) * radius),
+                    scale(axes[1], std::sin(angle1) * radius)
+                )
+            );
+
+            LONG x0 = 0;
+            LONG y0 = 0;
+            LONG x1 = 0;
+            LONG y1 = 0;
+
+            if (
+                !projectWorldPoint(point0, eyeView, width, height, &x0, &y0) ||
+                !projectWorldPoint(point1, eyeView, width, height, &x1, &y1)
+            ) {
+                continue;
+            }
+
+            appendLineRectangles(
+                rectangles,
+                x0,
+                y0,
+                x1,
+                y1,
+                static_cast<LONG>(width),
+                static_cast<LONG>(height),
+                halfThickness
+            );
+        }
+    }
+}
+
 void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
     ID3D11RenderTargetView* renderTargetView = nullptr;
     uint32_t width = 0;
@@ -1347,9 +1442,15 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
     XrVector3f rightIndexTip{0.0f, 0.0f, 0.0f};
     XrVector3f target{0.0f, 0.0f, 0.0f};
     bool proximityActive = false;
+    int selectedConnectorIndex = -1;
+    float selectedConnectorDistance = 0.0f;
     bool logTargetInitialization = false;
     bool logProximityEntered = false;
     bool logProximityExited = false;
+    bool logSelectedConnectorChanged = false;
+    bool logConnectorTouchEntered = false;
+    bool logConnectorTouchExited = false;
+    int previousSelectedConnectorIndex = -1;
 
     {
         std::lock_guard<std::mutex> lock(gStateMutex);
@@ -1430,15 +1531,125 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
             rightIndexTip.y,
             rightIndexTip.z
         };
-        const Vec3 targetPoint{target.x, target.y, target.z};
-        constexpr float kActivationRadius = 0.05f;
-        proximityActive =
-            distanceBetween(fingertip, targetPoint) <= kActivationRadius;
 
-        if (proximityActive != gIndexInsideProximity) {
-            gIndexInsideProximity = proximityActive;
-            logProximityEntered = proximityActive;
-            logProximityExited = !proximityActive;
+        previousSelectedConnectorIndex = gSelectedConnectorIndex;
+
+        if (gCalibrationFrameReady) {
+            static constexpr std::array<Vec3, 9> kSelectionConnectors{{
+                {0.7405973673f, -0.1893186867f,  0.0295004621f},
+                {0.7397546172f, -0.1867421865f, -0.0041990783f},
+                {0.7297000885f, -0.2159425467f, -0.0223697796f},
+                {0.7524973154f, -0.2948178649f, -0.2870004177f},
+                {0.7524973750f, -0.2948178649f, -0.2100002468f},
+                {0.7331519127f, -0.4045305252f, -0.1702503562f},
+                {0.7524974942f, -0.2948176563f,  0.2099997848f},
+                {0.7524974942f, -0.2948176861f,  0.2869997919f},
+                {0.7331521511f, -0.4045309722f,  0.3267496824f}
+            }};
+
+            std::array<Vec3, kSelectionConnectors.size()> projectedConnectors{};
+            float nearestDistance = std::numeric_limits<float>::max();
+            int nearestIndex = -1;
+
+            for (size_t index = 0; index < kSelectionConnectors.size(); ++index) {
+                projectedConnectors[index] =
+                    transformDcsToXr(kSelectionConnectors[index]);
+                const float distance =
+                    distanceBetween(fingertip, projectedConnectors[index]);
+
+                if (distance < nearestDistance) {
+                    nearestDistance = distance;
+                    nearestIndex = static_cast<int>(index);
+                }
+            }
+
+            constexpr float kHoverEnterRadius = 0.035f;
+            constexpr float kHoverExitRadius = 0.050f;
+            constexpr float kTouchEnterRadius = 0.015f;
+            constexpr float kTouchExitRadius = 0.022f;
+
+            int chosenIndex = gSelectedConnectorIndex;
+            float chosenDistance = std::numeric_limits<float>::max();
+
+            if (
+                chosenIndex >= 0 &&
+                static_cast<size_t>(chosenIndex) < projectedConnectors.size()
+            ) {
+                chosenDistance =
+                    distanceBetween(fingertip, projectedConnectors[chosenIndex]);
+
+                if (chosenDistance > kHoverExitRadius) {
+                    chosenIndex = -1;
+                }
+            } else {
+                chosenIndex = -1;
+            }
+
+            if (
+                chosenIndex < 0 &&
+                nearestIndex >= 0 &&
+                nearestDistance <= kHoverEnterRadius
+            ) {
+                chosenIndex = nearestIndex;
+                chosenDistance = nearestDistance;
+            } else if (
+                chosenIndex >= 0 &&
+                nearestIndex >= 0 &&
+                nearestIndex != chosenIndex &&
+                nearestDistance + 0.008f < chosenDistance
+            ) {
+                // Require an 8 mm advantage before switching to a neighbor.
+                chosenIndex = nearestIndex;
+                chosenDistance = nearestDistance;
+            }
+
+            bool touchActive = gSelectedConnectorTouchActive;
+            if (chosenIndex < 0) {
+                touchActive = false;
+                chosenDistance = 0.0f;
+            } else if (touchActive) {
+                touchActive = chosenDistance <= kTouchExitRadius;
+            } else {
+                touchActive = chosenDistance <= kTouchEnterRadius;
+            }
+
+            logSelectedConnectorChanged =
+                chosenIndex != gSelectedConnectorIndex;
+            logConnectorTouchEntered =
+                touchActive && !gSelectedConnectorTouchActive;
+            logConnectorTouchExited =
+                !touchActive && gSelectedConnectorTouchActive;
+
+            gSelectedConnectorIndex = chosenIndex;
+            gSelectedConnectorDistanceMeters = chosenDistance;
+            gSelectedConnectorTouchActive = touchActive;
+            gIndexInsideProximity = touchActive;
+
+            selectedConnectorIndex = chosenIndex;
+            selectedConnectorDistance = chosenDistance;
+            proximityActive = touchActive;
+
+            if (chosenIndex >= 0) {
+                const Vec3 selectedPoint = projectedConnectors[chosenIndex];
+                gProximityTarget = {
+                    selectedPoint.x,
+                    selectedPoint.y,
+                    selectedPoint.z
+                };
+                target = gProximityTarget;
+            }
+        } else {
+            const Vec3 targetPoint{target.x, target.y, target.z};
+            constexpr float kCalibrationActivationRadius = 0.05f;
+            proximityActive =
+                distanceBetween(fingertip, targetPoint) <=
+                kCalibrationActivationRadius;
+
+            if (proximityActive != gIndexInsideProximity) {
+                gIndexInsideProximity = proximityActive;
+                logProximityEntered = proximityActive;
+                logProximityExited = !proximityActive;
+            }
         }
 
         renderTargetView->AddRef();
@@ -1459,6 +1670,63 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
     }
     if (logProximityExited) {
         logLine("Right index exited Master Caution proximity target");
+    }
+
+    static constexpr std::array<const char*, 9> kConnectorNames{{
+        "MASTER_CAUTION",
+        "UFC_ENTER",
+        "UFC_CLR",
+        "LEFT_MFCD_OSB1",
+        "LEFT_MFCD_OSB5",
+        "LEFT_MFCD_OSB10",
+        "RIGHT_MFCD_OSB1",
+        "RIGHT_MFCD_OSB5",
+        "RIGHT_MFCD_OSB10"
+    }};
+
+    if (logSelectedConnectorChanged) {
+        if (
+            selectedConnectorIndex >= 0 &&
+            static_cast<size_t>(selectedConnectorIndex) < kConnectorNames.size()
+        ) {
+            logLine(
+                std::string("Nearest connector selected: ") +
+                kConnectorNames[selectedConnectorIndex] +
+                ", distanceMm=" +
+                std::to_string(selectedConnectorDistance * 1000.0f)
+            );
+        } else {
+            logLine("Nearest connector selection cleared");
+        }
+    }
+
+    if (
+        logConnectorTouchEntered &&
+        selectedConnectorIndex >= 0 &&
+        static_cast<size_t>(selectedConnectorIndex) < kConnectorNames.size()
+    ) {
+        logLine(
+            std::string("Right index entered touch zone: ") +
+            kConnectorNames[selectedConnectorIndex] +
+            ", distanceMm=" +
+            std::to_string(selectedConnectorDistance * 1000.0f)
+        );
+    }
+
+    if (logConnectorTouchExited) {
+        const int logIndex =
+            selectedConnectorIndex >= 0
+                ? selectedConnectorIndex
+                : previousSelectedConnectorIndex;
+        if (
+            logIndex >= 0 &&
+            static_cast<size_t>(logIndex) < kConnectorNames.size()
+        ) {
+            logLine(
+                std::string("Right index exited touch zone: ") +
+                kConnectorNames[logIndex]
+            );
+        }
     }
 
     Vec3 forward{};
@@ -1506,12 +1774,16 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
 
     std::vector<D3D11_RECT> fingertipRectangles;
     std::vector<D3D11_RECT> targetRectangles;
-    fingertipRectangles.reserve(12 * 19);
+    std::vector<D3D11_RECT> hoveredConnectorRectangles;
+    std::vector<D3D11_RECT> activeConnectorRectangles;
+    fingertipRectangles.reserve(3 * 24 * 19);
     targetRectangles.reserve(9 * 12 * 19);
+    hoveredConnectorRectangles.reserve(12 * 19);
+    activeConnectorRectangles.reserve(12 * 19);
 
-    appendProjectedCubeRectangles(
+    appendProjectedWireSphereRectangles(
         fingertipCenter,
-        0.0080f,
+        0.0050f,
         1,
         right,
         up,
@@ -1544,11 +1816,21 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
             {0.7331521511f, -0.4045309722f,  0.3267496824f}   // Right OSB 10
         }};
 
-        for (const Vec3& cockpitConnector : kCockpitConnectors) {
-            const Vec3 projected = transformDcsToXr(cockpitConnector);
+        for (size_t index = 0; index < kCockpitConnectors.size(); ++index) {
+            const Vec3 projected =
+                transformDcsToXr(kCockpitConnectors[index]);
+
+            std::vector<D3D11_RECT>* destination = &targetRectangles;
+            if (static_cast<int>(index) == selectedConnectorIndex) {
+                destination =
+                    proximityActive
+                        ? &activeConnectorRectangles
+                        : &hoveredConnectorRectangles;
+            }
+
             appendProjectedCubeRectangles(
                 projected,
-                0.0090f,
+                0.0050f,
                 1,
                 right,
                 up,
@@ -1556,7 +1838,7 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
                 eyeView,
                 width,
                 height,
-                &targetRectangles
+                destination
             );
         }
     } else {
@@ -1574,7 +1856,12 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
         );
     }
 
-    if (fingertipRectangles.empty() && targetRectangles.empty()) {
+    if (
+        fingertipRectangles.empty() &&
+        targetRectangles.empty() &&
+        hoveredConnectorRectangles.empty() &&
+        activeConnectorRectangles.empty()
+    ) {
         renderTargetView->Release();
         return;
     }
@@ -1614,9 +1901,11 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
         return;
     }
 
-    const FLOAT fingertipColor[4] = {0.15f, 0.75f, 1.0f, 1.0f};
+    const FLOAT fingertipIdleColor[4] = {1.0f, 0.90f, 0.05f, 1.0f};
+    const FLOAT fingertipActiveColor[4] = {0.15f, 1.0f, 0.20f, 1.0f};
     const FLOAT targetWaitingColor[4] = {1.0f, 0.35f, 0.05f, 1.0f};
     const FLOAT targetProjectedColor[4] = {0.05f, 0.90f, 1.0f, 1.0f};
+    const FLOAT targetHoveredColor[4] = {0.65f, 1.0f, 1.0f, 1.0f};
     const FLOAT targetActiveColor[4] = {0.15f, 1.0f, 0.20f, 1.0f};
 
     bool calibrationReady = false;
@@ -1626,9 +1915,7 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
     }
 
     const FLOAT* targetColor =
-        proximityActive
-            ? targetActiveColor
-            : (calibrationReady ? targetProjectedColor : targetWaitingColor);
+        calibrationReady ? targetProjectedColor : targetWaitingColor;
 
     if (!targetRectangles.empty()) {
         context1->ClearView(
@@ -1639,10 +1926,28 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
         );
     }
 
+    if (!hoveredConnectorRectangles.empty()) {
+        context1->ClearView(
+            renderTargetView,
+            targetHoveredColor,
+            hoveredConnectorRectangles.data(),
+            static_cast<UINT>(hoveredConnectorRectangles.size())
+        );
+    }
+
+    if (!activeConnectorRectangles.empty()) {
+        context1->ClearView(
+            renderTargetView,
+            targetActiveColor,
+            activeConnectorRectangles.data(),
+            static_cast<UINT>(activeConnectorRectangles.size())
+        );
+    }
+
     if (!fingertipRectangles.empty()) {
         context1->ClearView(
             renderTargetView,
-            fingertipColor,
+            proximityActive ? fingertipActiveColor : fingertipIdleColor,
             fingertipRectangles.data(),
             static_cast<UINT>(fingertipRectangles.size())
         );
