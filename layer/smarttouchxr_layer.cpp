@@ -116,6 +116,14 @@ XrVector3f gCalibrationOrigin{0.0f, 0.0f, 0.0f};
 XrVector3f gCalibrationAxisX{1.0f, 0.0f, 0.0f};
 XrVector3f gCalibrationAxisY{0.0f, 1.0f, 0.0f};
 XrVector3f gCalibrationAxisZ{0.0f, 0.0f, 1.0f};
+std::array<std::array<float, 3>, 3> gDcsToXrRotation{{
+    {{1.0f, 0.0f, 0.0f}},
+    {{0.0f, 1.0f, 0.0f}},
+    {{0.0f, 0.0f, 1.0f}}
+}};
+XrVector3f gDcsToXrTranslation{0.0f, 0.0f, 0.0f};
+float gCalibrationRmsErrorMeters = 0.0f;
+float gCalibrationMaxErrorMeters = 0.0f;
 bool gLoggedStereoViewSample = false;
 std::array<XrView, 2> gLatestViews{{
     {XR_TYPE_VIEW},
@@ -746,6 +754,69 @@ Vec3 cross(const Vec3& a, const Vec3& b) {
     };
 }
 
+float dot(const Vec3& a, const Vec3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+Vec3 centroid(const std::array<Vec3, 3>& points) {
+    return scale(add(add(points[0], points[1]), points[2]), 1.0f / 3.0f);
+}
+
+struct OrthonormalBasis {
+    Vec3 x;
+    Vec3 y;
+    Vec3 z;
+    bool valid;
+};
+
+OrthonormalBasis buildCalibrationBasis(
+    const Vec3& master,
+    const Vec3& left,
+    const Vec3& right
+) {
+    const Vec3 x = normalize(subtract(right, left));
+    const Vec3 midpoint = scale(add(left, right), 0.5f);
+    const Vec3 towardMaster = subtract(master, midpoint);
+    const Vec3 yUnnormalized = subtract(
+        towardMaster,
+        scale(x, dot(towardMaster, x))
+    );
+    const Vec3 y = normalize(yUnnormalized);
+    const Vec3 z = normalize(cross(x, y));
+
+    const bool valid =
+        dot(x, x) > 0.99f &&
+        dot(y, y) > 0.99f &&
+        dot(z, z) > 0.99f;
+
+    return {x, y, z, valid};
+}
+
+Vec3 rotateDcsToXr(const Vec3& value) {
+    return {
+        gDcsToXrRotation[0][0] * value.x +
+            gDcsToXrRotation[0][1] * value.y +
+            gDcsToXrRotation[0][2] * value.z,
+        gDcsToXrRotation[1][0] * value.x +
+            gDcsToXrRotation[1][1] * value.y +
+            gDcsToXrRotation[1][2] * value.z,
+        gDcsToXrRotation[2][0] * value.x +
+            gDcsToXrRotation[2][1] * value.y +
+            gDcsToXrRotation[2][2] * value.z
+    };
+}
+
+Vec3 transformDcsToXr(const Vec3& value) {
+    return add(
+        rotateDcsToXr(value),
+        {
+            gDcsToXrTranslation.x,
+            gDcsToXrTranslation.y,
+            gDcsToXrTranslation.z
+        }
+    );
+}
+
 std::string calibrationPath() {
     char localAppData[MAX_PATH]{};
     const DWORD length = GetEnvironmentVariableA(
@@ -757,53 +828,226 @@ std::string calibrationPath() {
     return directory + "\\A10CII-three-point-calibration.txt";
 }
 
-void saveCalibrationFrame() {
+void saveCalibrationFrame(
+    const std::array<Vec3, 3>& dcsPoints,
+    const std::array<Vec3, 3>& predictedXrPoints,
+    const std::array<float, 3>& pointErrors
+) {
     std::ofstream file(calibrationPath(), std::ios::trunc);
     if (!file) {
         logLine("Failed to save three-point calibration file");
         return;
     }
+
     file << "module=A-10C_2\n";
-    file << "origin=" << gCalibrationOrigin.x << ',' << gCalibrationOrigin.y << ',' << gCalibrationOrigin.z << '\n';
-    file << "axis_x=" << gCalibrationAxisX.x << ',' << gCalibrationAxisX.y << ',' << gCalibrationAxisX.z << '\n';
-    file << "axis_y=" << gCalibrationAxisY.x << ',' << gCalibrationAxisY.y << ',' << gCalibrationAxisY.z << '\n';
-    file << "axis_z=" << gCalibrationAxisZ.x << ',' << gCalibrationAxisZ.y << ',' << gCalibrationAxisZ.z << '\n';
-    file << "master_caution=" << gCalibrationPoints[0].x << ',' << gCalibrationPoints[0].y << ',' << gCalibrationPoints[0].z << '\n';
-    file << "left_mfcd_osb1=" << gCalibrationPoints[1].x << ',' << gCalibrationPoints[1].y << ',' << gCalibrationPoints[1].z << '\n';
-    file << "right_mfcd_osb1=" << gCalibrationPoints[2].x << ',' << gCalibrationPoints[2].y << ',' << gCalibrationPoints[2].z << '\n';
-    logLine(std::string("Three-point calibration saved: ") + calibrationPath());
+    file << "method=rigid_basis_fit_with_centroid_translation\n";
+    file << "units=meters\n";
+    file << "rotation_row_0="
+         << gDcsToXrRotation[0][0] << ','
+         << gDcsToXrRotation[0][1] << ','
+         << gDcsToXrRotation[0][2] << '\n';
+    file << "rotation_row_1="
+         << gDcsToXrRotation[1][0] << ','
+         << gDcsToXrRotation[1][1] << ','
+         << gDcsToXrRotation[1][2] << '\n';
+    file << "rotation_row_2="
+         << gDcsToXrRotation[2][0] << ','
+         << gDcsToXrRotation[2][1] << ','
+         << gDcsToXrRotation[2][2] << '\n';
+    file << "translation="
+         << gDcsToXrTranslation.x << ','
+         << gDcsToXrTranslation.y << ','
+         << gDcsToXrTranslation.z << '\n';
+    file << "rms_error_m=" << gCalibrationRmsErrorMeters << '\n';
+    file << "max_error_m=" << gCalibrationMaxErrorMeters << '\n';
+
+    static constexpr const char* kNames[3] = {
+        "master_caution",
+        "left_mfcd_osb1",
+        "right_mfcd_osb1"
+    };
+
+    for (size_t index = 0; index < 3; ++index) {
+        file << kNames[index] << "_dcs="
+             << dcsPoints[index].x << ','
+             << dcsPoints[index].y << ','
+             << dcsPoints[index].z << '\n';
+        file << kNames[index] << "_captured_xr="
+             << gCalibrationPoints[index].x << ','
+             << gCalibrationPoints[index].y << ','
+             << gCalibrationPoints[index].z << '\n';
+        file << kNames[index] << "_predicted_xr="
+             << predictedXrPoints[index].x << ','
+             << predictedXrPoints[index].y << ','
+             << predictedXrPoints[index].z << '\n';
+        file << kNames[index] << "_error_m=" << pointErrors[index] << '\n';
+    }
+
+    logLine(std::string("Three-point rigid transform saved: ") + calibrationPath());
 }
 
 void rebuildCalibrationFrameIfComplete() {
-    if (!gCalibrationPointValid[0] || !gCalibrationPointValid[1] || !gCalibrationPointValid[2]) {
+    if (!gCalibrationPointValid[0] ||
+        !gCalibrationPointValid[1] ||
+        !gCalibrationPointValid[2]) {
         return;
     }
 
-    const Vec3 master{gCalibrationPoints[0].x, gCalibrationPoints[0].y, gCalibrationPoints[0].z};
-    const Vec3 left{gCalibrationPoints[1].x, gCalibrationPoints[1].y, gCalibrationPoints[1].z};
-    const Vec3 right{gCalibrationPoints[2].x, gCalibrationPoints[2].y, gCalibrationPoints[2].z};
+    // Coordinates already validated against DCS cockpit highlight coordinates:
+    // x = forward/aft, y = up/down, z = right/left.
+    const std::array<Vec3, 3> dcsPoints{{
+        {0.7405973673f, -0.1893186867f,  0.0295004621f},  // Master Caution
+        {0.7524973154f, -0.2948178649f, -0.2870004177f},  // Left MFCD OSB 1
+        {0.7524974942f, -0.2948176563f,  0.2099997848f}   // Right MFCD OSB 1
+    }};
 
-    const Vec3 axisX = normalize(subtract(right, left));
-    const Vec3 planeReference = subtract(master, scale(add(left, right), 0.5f));
-    const Vec3 axisZ = normalize(cross(axisX, planeReference));
-    const Vec3 axisY = normalize(cross(axisZ, axisX));
+    const std::array<Vec3, 3> xrPoints{{
+        {
+            gCalibrationPoints[0].x,
+            gCalibrationPoints[0].y,
+            gCalibrationPoints[0].z
+        },
+        {
+            gCalibrationPoints[1].x,
+            gCalibrationPoints[1].y,
+            gCalibrationPoints[1].z
+        },
+        {
+            gCalibrationPoints[2].x,
+            gCalibrationPoints[2].y,
+            gCalibrationPoints[2].z
+        }
+    }};
 
-    if (distanceBetween(axisX, {0.0f, 0.0f, 0.0f}) < 0.5f ||
-        distanceBetween(axisY, {0.0f, 0.0f, 0.0f}) < 0.5f ||
-        distanceBetween(axisZ, {0.0f, 0.0f, 0.0f}) < 0.5f) {
-        logLine("Three-point calibration rejected: points are degenerate or nearly aligned");
+    const OrthonormalBasis dcsBasis = buildCalibrationBasis(
+        dcsPoints[0],
+        dcsPoints[1],
+        dcsPoints[2]
+    );
+    const OrthonormalBasis xrBasis = buildCalibrationBasis(
+        xrPoints[0],
+        xrPoints[1],
+        xrPoints[2]
+    );
+
+    if (!dcsBasis.valid || !xrBasis.valid) {
+        logLine(
+            "Three-point rigid transform rejected: "
+            "points are degenerate or nearly aligned"
+        );
         return;
     }
 
-    gCalibrationOrigin = {master.x, master.y, master.z};
-    gCalibrationAxisX = {axisX.x, axisX.y, axisX.z};
-    gCalibrationAxisY = {axisY.x, axisY.y, axisY.z};
-    gCalibrationAxisZ = {axisZ.x, axisZ.y, axisZ.z};
+    const Vec3 dcsAxes[3] = {
+        dcsBasis.x,
+        dcsBasis.y,
+        dcsBasis.z
+    };
+    const Vec3 xrAxes[3] = {
+        xrBasis.x,
+        xrBasis.y,
+        xrBasis.z
+    };
+
+    // R = B_xr * transpose(B_dcs), where each basis matrix stores axes
+    // as columns. This produces a proper rigid rotation with determinant +1.
+    for (size_t row = 0; row < 3; ++row) {
+        for (size_t column = 0; column < 3; ++column) {
+            const float xrComponents[3] = {
+                row == 0 ? xrAxes[0].x : (row == 1 ? xrAxes[0].y : xrAxes[0].z),
+                row == 0 ? xrAxes[1].x : (row == 1 ? xrAxes[1].y : xrAxes[1].z),
+                row == 0 ? xrAxes[2].x : (row == 1 ? xrAxes[2].y : xrAxes[2].z)
+            };
+            const float dcsComponents[3] = {
+                column == 0 ? dcsAxes[0].x : (column == 1 ? dcsAxes[0].y : dcsAxes[0].z),
+                column == 0 ? dcsAxes[1].x : (column == 1 ? dcsAxes[1].y : dcsAxes[1].z),
+                column == 0 ? dcsAxes[2].x : (column == 1 ? dcsAxes[2].y : dcsAxes[2].z)
+            };
+
+            gDcsToXrRotation[row][column] =
+                xrComponents[0] * dcsComponents[0] +
+                xrComponents[1] * dcsComponents[1] +
+                xrComponents[2] * dcsComponents[2];
+        }
+    }
+
+    const Vec3 dcsCenter = centroid(dcsPoints);
+    const Vec3 xrCenter = centroid(xrPoints);
+    const Vec3 rotatedDcsCenter = rotateDcsToXr(dcsCenter);
+    const Vec3 translation = subtract(xrCenter, rotatedDcsCenter);
+
+    gDcsToXrTranslation = {
+        translation.x,
+        translation.y,
+        translation.z
+    };
+
+    std::array<Vec3, 3> predictedXrPoints{};
+    std::array<float, 3> pointErrors{};
+    float squaredErrorSum = 0.0f;
+    float maxError = 0.0f;
+
+    for (size_t index = 0; index < 3; ++index) {
+        predictedXrPoints[index] = transformDcsToXr(dcsPoints[index]);
+        pointErrors[index] = distanceBetween(
+            predictedXrPoints[index],
+            xrPoints[index]
+        );
+        squaredErrorSum += pointErrors[index] * pointErrors[index];
+        maxError = std::max(maxError, pointErrors[index]);
+    }
+
+    gCalibrationRmsErrorMeters = std::sqrt(squaredErrorSum / 3.0f);
+    gCalibrationMaxErrorMeters = maxError;
+
+    // Keep the legacy frame fields useful for current prototype rendering.
+    gCalibrationOrigin = {
+        gDcsToXrTranslation.x,
+        gDcsToXrTranslation.y,
+        gDcsToXrTranslation.z
+    };
+    gCalibrationAxisX = {
+        gDcsToXrRotation[0][0],
+        gDcsToXrRotation[1][0],
+        gDcsToXrRotation[2][0]
+    };
+    gCalibrationAxisY = {
+        gDcsToXrRotation[0][1],
+        gDcsToXrRotation[1][1],
+        gDcsToXrRotation[2][1]
+    };
+    gCalibrationAxisZ = {
+        gDcsToXrRotation[0][2],
+        gDcsToXrRotation[1][2],
+        gDcsToXrRotation[2][2]
+    };
+
     gCalibrationFrameReady = true;
-    gProximityTarget = gCalibrationPoints[0];
+
+    const Vec3 transformedMaster = transformDcsToXr(dcsPoints[0]);
+    gProximityTarget = {
+        transformedMaster.x,
+        transformedMaster.y,
+        transformedMaster.z
+    };
     gProximityTargetInitialized = true;
-    saveCalibrationFrame();
-    logLine("Three-point cockpit calibration complete");
+
+    saveCalibrationFrame(dcsPoints, predictedXrPoints, pointErrors);
+
+    logLine(
+        std::string("Three-point rigid transform complete: rmsErrorMm=") +
+        std::to_string(gCalibrationRmsErrorMeters * 1000.0f) +
+        ", maxErrorMm=" +
+        std::to_string(gCalibrationMaxErrorMeters * 1000.0f)
+    );
+    logLine(
+        std::string("DCS-to-OpenXR translation: x=") +
+        std::to_string(gDcsToXrTranslation.x) +
+        ", y=" +
+        std::to_string(gDcsToXrTranslation.y) +
+        ", z=" +
+        std::to_string(gDcsToXrTranslation.z)
+    );
 }
 
 bool initializeCalibrationUdp() {
