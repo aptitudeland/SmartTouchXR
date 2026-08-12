@@ -112,6 +112,10 @@ std::array<XrVector3f, 3> gCalibrationPoints{{
 }};
 std::array<bool, 3> gCalibrationPointValid{{false, false, false}};
 bool gCalibrationFrameReady = false;
+ULONGLONG gCalibrationOverUntilMs = 0;
+bool gResetShortcutWasDown = false;
+int gSelectedConnectorIndex = -1;
+int gLastCalibrationCapturedIndex = -1;
 XrVector3f gCalibrationOrigin{0.0f, 0.0f, 0.0f};
 XrVector3f gCalibrationAxisX{1.0f, 0.0f, 0.0f};
 XrVector3f gCalibrationAxisY{0.0f, 1.0f, 0.0f};
@@ -1023,6 +1027,12 @@ void rebuildCalibrationFrameIfComplete() {
     };
 
     gCalibrationFrameReady = true;
+    gCalibrationOverUntilMs = GetTickCount64() + 4000ULL;
+    gSelectedConnectorIndex = -1;
+    gIndexInsideProximity = false;
+
+    logLine("Calibration locked after successful three-point fit");
+    logLine("HUD state: CALIBRATION OVER for 4 seconds");
 
     // Fourth validation point: UFC ENTER. This connector was not used by
     // the three-point fit. If the rendered cube lands on the physical ENTER
@@ -1106,6 +1116,47 @@ bool initializeCalibrationUdp() {
     return true;
 }
 
+
+void resetCalibrationState(const char* source) {
+    gCalibrationPointValid = {{false, false, false}};
+    gCalibrationPoints = {{
+        {0.0f, 0.0f, 0.0f},
+        {0.0f, 0.0f, 0.0f},
+        {0.0f, 0.0f, 0.0f}
+    }};
+    gCalibrationFrameReady = false;
+    gCalibrationOverUntilMs = 0;
+    gSelectedConnectorIndex = -1;
+    gLastCalibrationCapturedIndex = -1;
+    gIndexInsideProximity = false;
+    gCalibrationRmsErrorMeters = 0.0f;
+    gCalibrationMaxErrorMeters = 0.0f;
+
+    // Recreate the temporary calibration target relative to the user's
+    // current head pose on the next render pass.
+    gProximityTargetInitialized = false;
+
+    logLine(
+        std::string("Calibration reset requested via ") +
+        (source != nullptr ? source : "unknown source")
+    );
+    logLine("Calibration unlocked; waiting for three calibration points");
+}
+
+bool pollCalibrationResetShortcut() {
+    const bool controlDown =
+        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool shiftDown =
+        (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool rDown =
+        (GetAsyncKeyState('R') & 0x8000) != 0;
+
+    const bool shortcutDown = controlDown && shiftDown && rDown;
+    const bool pressedNow = shortcutDown && !gResetShortcutWasDown;
+    gResetShortcutWasDown = shortcutDown;
+    return pressedNow;
+}
+
 int calibrationIndexForMessage(const std::string& message) {
     if (message.find("MASTER_CAUTION") != std::string::npos) return 0;
     if (message.find("LEFT_MFCD_OSB1") != std::string::npos) return 1;
@@ -1141,23 +1192,76 @@ void pollCalibrationUdp(const XrVector3f& currentIndexTip) {
 
         buffer[received] = '\0';
         const std::string message(buffer, static_cast<size_t>(received));
+
+        if (message.find("RESET_CALIBRATION") != std::string::npos) {
+            resetCalibrationState("UDP RESET_CALIBRATION");
+            continue;
+        }
+
         const int index = calibrationIndexForMessage(message);
         if (index < 0) {
             logLine(std::string("UDP calibration ignored message: ") + message);
             continue;
         }
 
-        gCalibrationPoints[static_cast<size_t>(index)] = currentIndexTip;
-        gCalibrationPointValid[static_cast<size_t>(index)] = true;
+        if (gCalibrationFrameReady) {
+            static constexpr const char* kFrozenNames[3] = {
+                "MASTER_CAUTION", "LEFT_MFCD_OSB1", "RIGHT_MFCD_OSB1"
+            };
+            logLine(
+                std::string("Calibration locked; ignored calibration event ") +
+                kFrozenNames[index]
+            );
+            continue;
+        }
+
         static constexpr const char* kNames[3] = {
             "MASTER_CAUTION", "LEFT_MFCD_OSB1", "RIGHT_MFCD_OSB1"
         };
+
+        int expectedIndex = 0;
+        while (
+            expectedIndex < 3 &&
+            gCalibrationPointValid[static_cast<size_t>(expectedIndex)]
+        ) {
+            ++expectedIndex;
+        }
+
+        if (expectedIndex >= 3) {
+            logLine("Calibration has all three points; waiting for final lock");
+            continue;
+        }
+
+        if (index != expectedIndex) {
+            logLine(
+                std::string("Ignored unexpected calibration event ") +
+                kNames[index] +
+                "; expected " +
+                kNames[expectedIndex]
+            );
+            continue;
+        }
+
+        gCalibrationPoints[static_cast<size_t>(index)] = currentIndexTip;
+        gCalibrationPointValid[static_cast<size_t>(index)] = true;
+        gLastCalibrationCapturedIndex = index;
+
+        // During calibration, the orange marker follows the latest point that
+        // was actually accepted. This makes the visual feedback progress from
+        // Master Caution -> Left MFCD OSB1 -> Right MFCD OSB1.
+        gProximityTarget = currentIndexTip;
+        gProximityTargetInitialized = true;
+
         logLine(
             std::string("Captured calibration point ") + kNames[index] +
             ": x=" + std::to_string(currentIndexTip.x) +
             ", y=" + std::to_string(currentIndexTip.y) +
             ", z=" + std::to_string(currentIndexTip.z)
         );
+        logLine(
+            std::string("Calibration marker moved to ") + kNames[index]
+        );
+
         rebuildCalibrationFrameIfComplete();
     }
 }
@@ -1337,6 +1441,257 @@ void appendProjectedCubeRectangles(
 }
 
 
+
+std::array<uint8_t, 7> calibrationHudGlyph(char character) {
+    switch (character) {
+        case 'A': return {{0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}};
+        case 'B': return {{0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}};
+        case 'C': return {{0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}};
+        case 'E': return {{0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}};
+        case 'I': return {{0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F}};
+        case 'L': return {{0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}};
+        case 'N': return {{0x11, 0x19, 0x19, 0x15, 0x13, 0x13, 0x11}};
+        case 'O': return {{0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}};
+        case 'R': return {{0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}};
+        case 'T': return {{0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}};
+        case 'V': return {{0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04}};
+        case 'D': return {{0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E}};
+        case 'F': return {{0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}};
+        case 'G': return {{0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F}};
+        case 'H': return {{0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}};
+        case 'M': return {{0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11}};
+        case 'S': return {{0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}};
+        case 'U': return {{0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}};
+        case '1': return {{0x04, 0x0C, 0x14, 0x04, 0x04, 0x04, 0x1F}};
+        case '2': return {{0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}};
+        case '3': return {{0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E}};
+        case '/': return {{0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10}};
+        default:  return {{0, 0, 0, 0, 0, 0, 0}};
+    }
+}
+
+void appendCalibrationHudText3D(
+    const std::string& message,
+    float verticalOffsetMeters,
+    const Vec3& panelCenter,
+    const Vec3& panelRight,
+    const Vec3& panelUp,
+    const XrView& eyeView,
+    uint32_t width,
+    uint32_t height,
+    std::vector<D3D11_RECT>* rectangles
+) {
+    if (rectangles == nullptr || message.empty()) {
+        return;
+    }
+
+    // Each bitmap "pixel" is a small square on a virtual plane 1.2 m in
+    // front of the user's head. Because the same 3D plane is projected through
+    // each XrView, both eyes receive physically consistent stereo disparity.
+    constexpr float kPixelSizeMeters = 0.0050f;
+    constexpr int kGlyphWidth = 5;
+    constexpr int kGlyphHeight = 7;
+    constexpr int kGlyphSpacing = 1;
+
+    const float characterAdvance =
+        static_cast<float>(kGlyphWidth + kGlyphSpacing) * kPixelSizeMeters;
+    const float textWidth =
+        static_cast<float>(message.size()) * characterAdvance -
+        static_cast<float>(kGlyphSpacing) * kPixelSizeMeters;
+
+    const Vec3 lineCenter = add(
+        panelCenter,
+        scale(panelUp, verticalOffsetMeters)
+    );
+    const Vec3 topLeft = add(
+        add(lineCenter, scale(panelRight, -0.5f * textWidth)),
+        scale(
+            panelUp,
+            0.5f * static_cast<float>(kGlyphHeight) * kPixelSizeMeters
+        )
+    );
+
+    for (size_t characterIndex = 0; characterIndex < message.size(); ++characterIndex) {
+        const auto glyph = calibrationHudGlyph(message[characterIndex]);
+
+        for (int row = 0; row < kGlyphHeight; ++row) {
+            for (int column = 0; column < kGlyphWidth; ++column) {
+                const uint8_t mask =
+                    static_cast<uint8_t>(1u << (kGlyphWidth - 1 - column));
+                if ((glyph[static_cast<size_t>(row)] & mask) == 0) {
+                    continue;
+                }
+
+                const float x =
+                    static_cast<float>(characterIndex) * characterAdvance +
+                    (static_cast<float>(column) + 0.5f) * kPixelSizeMeters;
+                const float y =
+                    -(static_cast<float>(row) + 0.5f) * kPixelSizeMeters;
+
+                const Vec3 pixelCenter = add(
+                    add(topLeft, scale(panelRight, x)),
+                    scale(panelUp, y)
+                );
+
+                const float halfPixel = 0.5f * kPixelSizeMeters;
+                const std::array<Vec3, 4> corners{{
+                    add(pixelCenter, add(scale(panelRight, -halfPixel), scale(panelUp,  halfPixel))),
+                    add(pixelCenter, add(scale(panelRight,  halfPixel), scale(panelUp,  halfPixel))),
+                    add(pixelCenter, add(scale(panelRight, -halfPixel), scale(panelUp, -halfPixel))),
+                    add(pixelCenter, add(scale(panelRight,  halfPixel), scale(panelUp, -halfPixel)))
+                }};
+
+                LONG minX = static_cast<LONG>(width);
+                LONG minY = static_cast<LONG>(height);
+                LONG maxX = 0;
+                LONG maxY = 0;
+                bool allProjected = true;
+
+                for (const Vec3& corner : corners) {
+                    LONG px = 0;
+                    LONG py = 0;
+                    if (!projectWorldPoint(corner, eyeView, width, height, &px, &py)) {
+                        allProjected = false;
+                        break;
+                    }
+                    minX = std::min(minX, px);
+                    minY = std::min(minY, py);
+                    maxX = std::max(maxX, px);
+                    maxY = std::max(maxY, py);
+                }
+
+                if (!allProjected) {
+                    continue;
+                }
+
+                D3D11_RECT rectangle{
+                    std::max<LONG>(0, minX),
+                    std::max<LONG>(0, minY),
+                    std::min<LONG>(static_cast<LONG>(width), maxX + 1),
+                    std::min<LONG>(static_cast<LONG>(height), maxY + 1)
+                };
+
+                if (
+                    rectangle.right > rectangle.left &&
+                    rectangle.bottom > rectangle.top
+                ) {
+                    rectangles->push_back(rectangle);
+                }
+            }
+        }
+    }
+}
+
+
+void appendConnectorLabel3D(
+    const std::string& message,
+    const Vec3& anchorPoint,
+    const Vec3& panelRight,
+    const Vec3& panelUp,
+    const XrView& eyeView,
+    uint32_t width,
+    uint32_t height,
+    std::vector<D3D11_RECT>* rectangles
+) {
+    if (rectangles == nullptr || message.empty()) {
+        return;
+    }
+
+    // Tiny label placed a few centimetres above the selected cockpit control.
+    // It lives in cockpit/OpenXR 3D space and is projected per-eye.
+    constexpr float kPixelSizeMeters = 0.0025f;
+    constexpr int kGlyphWidth = 5;
+    constexpr int kGlyphHeight = 7;
+    constexpr int kGlyphSpacing = 1;
+
+    const float characterAdvance =
+        static_cast<float>(kGlyphWidth + kGlyphSpacing) * kPixelSizeMeters;
+    const float textWidth =
+        static_cast<float>(message.size()) * characterAdvance -
+        static_cast<float>(kGlyphSpacing) * kPixelSizeMeters;
+
+    const Vec3 labelCenter = add(anchorPoint, scale(panelUp, 0.022f));
+    const Vec3 topLeft = add(
+        add(labelCenter, scale(panelRight, -0.5f * textWidth)),
+        scale(
+            panelUp,
+            0.5f * static_cast<float>(kGlyphHeight) * kPixelSizeMeters
+        )
+    );
+
+    for (size_t characterIndex = 0; characterIndex < message.size(); ++characterIndex) {
+        const auto glyph = calibrationHudGlyph(message[characterIndex]);
+
+        for (int row = 0; row < kGlyphHeight; ++row) {
+            for (int column = 0; column < kGlyphWidth; ++column) {
+                const uint8_t mask =
+                    static_cast<uint8_t>(1u << (kGlyphWidth - 1 - column));
+
+                if ((glyph[static_cast<size_t>(row)] & mask) == 0) {
+                    continue;
+                }
+
+                const float x =
+                    static_cast<float>(characterIndex) * characterAdvance +
+                    (static_cast<float>(column) + 0.5f) * kPixelSizeMeters;
+                const float y =
+                    -(static_cast<float>(row) + 0.5f) * kPixelSizeMeters;
+
+                const Vec3 pixelCenter = add(
+                    add(topLeft, scale(panelRight, x)),
+                    scale(panelUp, y)
+                );
+
+                const float halfPixel = 0.5f * kPixelSizeMeters;
+                const std::array<Vec3, 4> corners{{
+                    add(pixelCenter, add(scale(panelRight, -halfPixel), scale(panelUp,  halfPixel))),
+                    add(pixelCenter, add(scale(panelRight,  halfPixel), scale(panelUp,  halfPixel))),
+                    add(pixelCenter, add(scale(panelRight, -halfPixel), scale(panelUp, -halfPixel))),
+                    add(pixelCenter, add(scale(panelRight,  halfPixel), scale(panelUp, -halfPixel)))
+                }};
+
+                LONG minX = static_cast<LONG>(width);
+                LONG minY = static_cast<LONG>(height);
+                LONG maxX = 0;
+                LONG maxY = 0;
+                bool allProjected = true;
+
+                for (const Vec3& corner : corners) {
+                    LONG px = 0;
+                    LONG py = 0;
+                    if (!projectWorldPoint(corner, eyeView, width, height, &px, &py)) {
+                        allProjected = false;
+                        break;
+                    }
+
+                    minX = std::min(minX, px);
+                    minY = std::min(minY, py);
+                    maxX = std::max(maxX, px);
+                    maxY = std::max(maxY, py);
+                }
+
+                if (!allProjected) {
+                    continue;
+                }
+
+                D3D11_RECT rectangle{
+                    std::max<LONG>(0, minX),
+                    std::max<LONG>(0, minY),
+                    std::min<LONG>(static_cast<LONG>(width), maxX + 1),
+                    std::min<LONG>(static_cast<LONG>(height), maxY + 1)
+                };
+
+                if (
+                    rectangle.right > rectangle.left &&
+                    rectangle.bottom > rectangle.top
+                ) {
+                    rectangles->push_back(rectangle);
+                }
+            }
+        }
+    }
+}
+
 void appendProjectedCircleRectangles(
     const Vec3& center,
     float radius,
@@ -1411,6 +1766,11 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
     bool logTargetInitialization = false;
     bool logProximityEntered = false;
     bool logProximityExited = false;
+    int previousSelectedConnectorIndex = -1;
+    bool showCalibrationHud = false;
+    bool showCalibrationOverHud = false;
+    int calibrationCapturedCount = 0;
+    int calibrationExpectedIndex = 0;
 
     static constexpr std::array<Vec3, 9> kCockpitConnectors{{
         {0.7405973673f, -0.1893186867f,  0.0295004621f},  // Master Caution
@@ -1498,17 +1858,16 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
             logTargetInitialization = true;
         }
 
-        pollCalibrationUdp(rightIndexTip);
-
-        // Before the three-point transform is complete, show the captured
-        // Master Caution point as a temporary calibration reference. Once the
-        // transform is ready, rebuildCalibrationFrameIfComplete() owns the
-        // target and places it on the independent UFC ENTER validation point.
-        if (!gCalibrationFrameReady && gCalibrationPointValid[0]) {
-            gProximityTarget = gCalibrationPoints[0];
-            gProximityTargetInitialized = true;
+        if (pollCalibrationResetShortcut()) {
+            resetCalibrationState("Ctrl+Shift+R");
         }
 
+        pollCalibrationUdp(rightIndexTip);
+
+        // While calibration is in progress, pollCalibrationUdp() owns the
+        // marker position and moves it to the latest accepted calibration
+        // point. Once complete, rebuildCalibrationFrameIfComplete() replaces
+        // it with the transformed validation target.
         target = gProximityTarget;
         const Vec3 fingertip{
             rightIndexTip.x,
@@ -1516,29 +1875,64 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
             rightIndexTip.z
         };
 
+        previousSelectedConnectorIndex = gSelectedConnectorIndex;
+
         if (gCalibrationFrameReady) {
-            constexpr float kActivationRadius = 0.030f;
-            float nearestDistance = 1000.0f;
-            int nearestIndex = -1;
+            constexpr float kEnterRadius = 0.025f;
+            constexpr float kExitRadius = 0.035f;
 
-            for (size_t index = 0; index < kCockpitConnectors.size(); ++index) {
-                const Vec3 projectedConnector =
-                    transformDcsToXr(kCockpitConnectors[index]);
-                const float connectorDistance =
-                    distanceBetween(fingertip, projectedConnector);
+            // Hysteresis: once a connector is selected, keep it until the
+            // fingertip moves farther than 35 mm. A new target is acquired
+            // only inside 25 mm.
+            if (
+                gSelectedConnectorIndex >= 0 &&
+                static_cast<size_t>(gSelectedConnectorIndex) <
+                    kCockpitConnectors.size()
+            ) {
+                const Vec3 selectedProjected = transformDcsToXr(
+                    kCockpitConnectors[
+                        static_cast<size_t>(gSelectedConnectorIndex)
+                    ]
+                );
+                const float selectedDistance =
+                    distanceBetween(fingertip, selectedProjected);
 
-                if (connectorDistance < nearestDistance) {
-                    nearestDistance = connectorDistance;
-                    nearestIndex = static_cast<int>(index);
+                activeConnectorDistance = selectedDistance;
+                if (selectedDistance <= kExitRadius) {
+                    activeConnectorIndex = gSelectedConnectorIndex;
+                    proximityActive = true;
+                } else {
+                    gSelectedConnectorIndex = -1;
                 }
             }
 
-            activeConnectorDistance = nearestDistance;
-            if (nearestIndex >= 0 && nearestDistance <= kActivationRadius) {
-                activeConnectorIndex = nearestIndex;
-                proximityActive = true;
+            if (gSelectedConnectorIndex < 0) {
+                float nearestDistance = 1000.0f;
+                int nearestIndex = -1;
+
+                for (size_t index = 0; index < kCockpitConnectors.size(); ++index) {
+                    const Vec3 projectedConnector =
+                        transformDcsToXr(kCockpitConnectors[index]);
+                    const float connectorDistance =
+                        distanceBetween(fingertip, projectedConnector);
+
+                    if (connectorDistance < nearestDistance) {
+                        nearestDistance = connectorDistance;
+                        nearestIndex = static_cast<int>(index);
+                    }
+                }
+
+                activeConnectorDistance = nearestDistance;
+                if (nearestIndex >= 0 && nearestDistance <= kEnterRadius) {
+                    gSelectedConnectorIndex = nearestIndex;
+                    activeConnectorIndex = nearestIndex;
+                    proximityActive = true;
+                }
             }
+
+            activeConnectorIndex = gSelectedConnectorIndex;
         } else {
+            gSelectedConnectorIndex = -1;
             // Keep the original calibration-reference proximity behavior until
             // all three calibration points have been captured.
             const Vec3 targetPoint{target.x, target.y, target.z};
@@ -1553,6 +1947,19 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
             logProximityExited = !proximityActive;
         }
 
+        showCalibrationHud = !gCalibrationFrameReady;
+        showCalibrationOverHud =
+            gCalibrationFrameReady &&
+            GetTickCount64() < gCalibrationOverUntilMs;
+
+        calibrationCapturedCount = 0;
+        for (bool valid : gCalibrationPointValid) {
+            if (valid) {
+                ++calibrationCapturedCount;
+            }
+        }
+        calibrationExpectedIndex = std::min(2, calibrationCapturedCount);
+
         renderTargetView->AddRef();
     }
 
@@ -1566,20 +1973,33 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
         );
         logLine("Waiting for DCS three-point calibration events over UDP");
     }
-    if (logProximityEntered) {
-        if (activeConnectorIndex >= 0) {
-            logLine(
-                std::string("Nearest connector selected: ") +
-                kCockpitConnectorNames[static_cast<size_t>(activeConnectorIndex)] +
-                ", distanceMm=" +
-                std::to_string(activeConnectorDistance * 1000.0f)
-            );
-        } else {
-            logLine("Right index entered calibration proximity target");
-        }
+    if (
+        previousSelectedConnectorIndex != activeConnectorIndex &&
+        activeConnectorIndex >= 0
+    ) {
+        logLine(
+            std::string("Connector target changed: ") +
+            kCockpitConnectorNames[static_cast<size_t>(activeConnectorIndex)] +
+            ", distanceMm=" +
+            std::to_string(activeConnectorDistance * 1000.0f)
+        );
     }
-    if (logProximityExited) {
-        logLine("Right index exited connector proximity");
+    if (
+        previousSelectedConnectorIndex >= 0 &&
+        activeConnectorIndex < 0
+    ) {
+        logLine(
+            std::string("Connector target released: ") +
+            kCockpitConnectorNames[
+                static_cast<size_t>(previousSelectedConnectorIndex)
+            ]
+        );
+    }
+    if (logProximityEntered && activeConnectorIndex < 0) {
+        logLine("Right index entered calibration proximity target");
+    }
+    if (logProximityExited && previousSelectedConnectorIndex < 0) {
+        logLine("Right index exited calibration proximity target");
     }
 
     Vec3 forward{};
@@ -1628,9 +2048,87 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
     std::vector<D3D11_RECT> fingertipRectangles;
     std::vector<D3D11_RECT> targetRectangles;
     std::vector<D3D11_RECT> activeTargetRectangles;
+    std::vector<D3D11_RECT> connectorLabelRectangles;
+    std::vector<D3D11_RECT> calibrationHudRectangles;
     fingertipRectangles.reserve(3 * 24 * 19);
     targetRectangles.reserve(9 * 12 * 19);
     activeTargetRectangles.reserve(12 * 19);
+    connectorLabelRectangles.reserve(400);
+    calibrationHudRectangles.reserve(500);
+
+    const Vec3 leftEyePosition{
+        leftView.pose.position.x,
+        leftView.pose.position.y,
+        leftView.pose.position.z
+    };
+    const Vec3 rightEyePosition{
+        rightView.pose.position.x,
+        rightView.pose.position.y,
+        rightView.pose.position.z
+    };
+    const Vec3 hudHeadCenter =
+        scale(add(leftEyePosition, rightEyePosition), 0.5f);
+    const Vec3 hudForward =
+        rotateByQuaternion(leftView.pose.orientation, {0.0f, 0.0f, -1.0f});
+    const Vec3 hudRight =
+        rotateByQuaternion(leftView.pose.orientation, {1.0f, 0.0f, 0.0f});
+    const Vec3 hudUp =
+        rotateByQuaternion(leftView.pose.orientation, {0.0f, 1.0f, 0.0f});
+
+    // Put the virtual text panel 0.8 m ahead and a little above gaze center.
+    const Vec3 hudPanelCenter = add(
+        add(hudHeadCenter, scale(hudForward, 0.80f)),
+        scale(hudUp, 0.08f)
+    );
+
+    if (showCalibrationHud) {
+        static constexpr std::array<const char*, 3> kCalibrationHudTargets{{
+            "MASTER CAUTION",
+            "LEFT MFCD OSB1",
+            "RIGHT MFCD OSB1"
+        }};
+        const int nextStep =
+            std::min(3, calibrationCapturedCount + 1);
+
+        appendCalibrationHudText3D(
+            std::string("CALIBRATION ") +
+                std::to_string(nextStep) +
+                "/3",
+            0.025f,
+            hudPanelCenter,
+            hudRight,
+            hudUp,
+            eyeView,
+            width,
+            height,
+            &calibrationHudRectangles
+        );
+        appendCalibrationHudText3D(
+            kCalibrationHudTargets[
+                static_cast<size_t>(calibrationExpectedIndex)
+            ],
+            -0.025f,
+            hudPanelCenter,
+            hudRight,
+            hudUp,
+            eyeView,
+            width,
+            height,
+            &calibrationHudRectangles
+        );
+    } else if (showCalibrationOverHud) {
+        appendCalibrationHudText3D(
+            "CALIBRATION OVER",
+            0.0f,
+            hudPanelCenter,
+            hudRight,
+            hudUp,
+            eyeView,
+            width,
+            height,
+            &calibrationHudRectangles
+        );
+    }
 
     // Small wireframe sphere at the tracked right-index fingertip.
     // Three orthogonal circles give a clear spherical cue without requiring
@@ -1695,9 +2193,32 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
     }
 
     if (
+        calibrationReadyForMarkers &&
+        activeConnectorIndex >= 0 &&
+        static_cast<size_t>(activeConnectorIndex) < kCockpitConnectors.size()
+    ) {
+        const Vec3 selectedProjected = transformDcsToXr(
+            kCockpitConnectors[static_cast<size_t>(activeConnectorIndex)]
+        );
+
+        appendConnectorLabel3D(
+            kCockpitConnectorNames[static_cast<size_t>(activeConnectorIndex)],
+            selectedProjected,
+            right,
+            up,
+            eyeView,
+            width,
+            height,
+            &connectorLabelRectangles
+        );
+    }
+
+    if (
         fingertipRectangles.empty() &&
         targetRectangles.empty() &&
-        activeTargetRectangles.empty()
+        activeTargetRectangles.empty() &&
+        connectorLabelRectangles.empty() &&
+        calibrationHudRectangles.empty()
     ) {
         renderTargetView->Release();
         return;
@@ -1742,6 +2263,9 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
     const FLOAT targetWaitingColor[4] = {1.0f, 0.35f, 0.05f, 1.0f};
     const FLOAT targetProjectedColor[4] = {0.05f, 0.90f, 1.0f, 1.0f};
     const FLOAT targetActiveColor[4] = {0.15f, 1.0f, 0.20f, 1.0f};
+    const FLOAT connectorLabelColor[4] = {0.95f, 0.95f, 0.95f, 1.0f};
+    const FLOAT calibrationHudColor[4] = {1.0f, 0.70f, 0.05f, 1.0f};
+    const FLOAT calibrationOverHudColor[4] = {0.15f, 1.0f, 0.20f, 1.0f};
 
     bool calibrationReady = false;
     {
@@ -1776,6 +2300,26 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
             fingertipColor,
             fingertipRectangles.data(),
             static_cast<UINT>(fingertipRectangles.size())
+        );
+    }
+
+    if (!connectorLabelRectangles.empty()) {
+        context1->ClearView(
+            renderTargetView,
+            connectorLabelColor,
+            connectorLabelRectangles.data(),
+            static_cast<UINT>(connectorLabelRectangles.size())
+        );
+    }
+
+    if (!calibrationHudRectangles.empty()) {
+        context1->ClearView(
+            renderTargetView,
+            showCalibrationOverHud
+                ? calibrationOverHudColor
+                : calibrationHudColor,
+            calibrationHudRectangles.data(),
+            static_cast<UINT>(calibrationHudRectangles.size())
         );
     }
 
