@@ -112,6 +112,8 @@ std::array<XrVector3f, 3> gCalibrationPoints{{
 }};
 std::array<bool, 3> gCalibrationPointValid{{false, false, false}};
 bool gCalibrationFrameReady = false;
+bool gCockpitActive = false;
+std::string gCockpitAircraftName;
 ULONGLONG gCalibrationOverUntilMs = 0;
 bool gResetShortcutWasDown = false;
 int gSelectedConnectorIndex = -1;
@@ -1193,14 +1195,58 @@ void pollCalibrationUdp(const XrVector3f& currentIndexTip) {
         buffer[received] = '\0';
         const std::string message(buffer, static_cast<size_t>(received));
 
+        if (message.rfind("COCKPIT_ENTERED;", 0) == 0) {
+            const std::string aircraft =
+                message.substr(std::string("COCKPIT_ENTERED;").size());
+
+            gCockpitActive = true;
+            gCockpitAircraftName = aircraft;
+            resetCalibrationState("cockpit entry");
+
+            logLine(
+                std::string("Cockpit entered: aircraft=") +
+                (aircraft.empty() ? "UNKNOWN" : aircraft)
+            );
+            logLine("SmartTouchXR cockpit interaction enabled");
+            continue;
+        }
+
+        if (message == "COCKPIT_LEFT") {
+            gCockpitActive = false;
+            gCockpitAircraftName.clear();
+            gSelectedConnectorIndex = -1;
+            gIndexInsideProximity = false;
+            gProximityTargetInitialized = false;
+            gCalibrationOverUntilMs = 0;
+
+            logLine("Cockpit left; SmartTouchXR cockpit interaction disabled");
+            continue;
+        }
+
         if (message.find("RESET_CALIBRATION") != std::string::npos) {
-            resetCalibrationState("UDP RESET_CALIBRATION");
+            if (gCockpitActive) {
+                resetCalibrationState("UDP RESET_CALIBRATION");
+            } else {
+                logLine("Ignored calibration reset while no cockpit is active");
+            }
             continue;
         }
 
         const int index = calibrationIndexForMessage(message);
         if (index < 0) {
-            logLine(std::string("UDP calibration ignored message: ") + message);
+            if (
+                message.find("SMARTTOUCHXR_CALIBRATION_HEARTBEAT") ==
+                    std::string::npos &&
+                message.find("SMARTTOUCHXR_SPECTATOR_HEARTBEAT") ==
+                    std::string::npos
+            ) {
+                logLine(std::string("UDP calibration ignored message: ") + message);
+            }
+            continue;
+        }
+
+        if (!gCockpitActive) {
+            logLine("Ignored calibration event while no cockpit is active");
             continue;
         }
 
@@ -1798,6 +1844,16 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
 
     {
         std::lock_guard<std::mutex> lock(gStateMutex);
+
+        // Cockpit-enter/leave UDP messages must be processed even while the
+        // visual interaction layer is inactive. Calibration capture messages
+        // still use the latest tracked fingertip once a cockpit is active.
+        pollCalibrationUdp(gLatestRightIndexTip);
+
+        if (!gCockpitActive) {
+            return;
+        }
+
         const auto it = gSwapchainStates.find(swapchain);
         if (
             it == gSwapchainStates.end() ||
@@ -1861,8 +1917,6 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
         if (pollCalibrationResetShortcut()) {
             resetCalibrationState("Ctrl+Shift+R");
         }
-
-        pollCalibrationUdp(rightIndexTip);
 
         // While calibration is in progress, pollCalibrationUdp() owns the
         // marker position and moves it to the latest accepted calibration
