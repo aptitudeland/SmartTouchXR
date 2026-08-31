@@ -3750,16 +3750,27 @@ bool buildCompositionTestQuad(XrCompositionLayerQuad* quad) {
 
     XrSpace localSpace = XR_NULL_HANDLE;
     XrSwapchain swapchain = XR_NULL_HANDLE;
+    bool calibrationReady = false;
+    bool targetInitialized = false;
+    XrVector3f target{0.0f, 0.0f, 0.0f};
 
     {
         std::lock_guard<std::mutex> lock(gStateMutex);
         localSpace = gCompositionLocalSpace;
         swapchain = gCompositionSwapchain;
+        calibrationReady = gCalibrationFrameReady;
+        targetInitialized = gProximityTargetInitialized;
+        target = gProximityTarget;
     }
 
+    // For this A/B test we only show the separate compositor marker once
+    // the three-point calibration has completed. At that point
+    // gProximityTarget is the transformed DCS UFC ENTER connector.
     if (
         localSpace == XR_NULL_HANDLE ||
-        swapchain == XR_NULL_HANDLE
+        swapchain == XR_NULL_HANDLE ||
+        !calibrationReady ||
+        !targetInitialized
     ) {
         return false;
     }
@@ -3781,10 +3792,14 @@ bool buildCompositionTestQuad(XrCompositionLayerQuad* quad) {
     };
     quad->subImage.imageArrayIndex = 0;
 
-    // Fixed world/local-space test panel.
+    // Same calibrated LOCAL-space point used by the existing UFC ENTER
+    // validation marker, but submitted as its own OpenXR composition layer.
     quad->pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
-    quad->pose.position = {0.0f, -0.10f, -0.65f};
-    quad->size = {0.05f, 0.05f};
+    quad->pose.position = target;
+
+    // Smaller than the first architectural prototype so the old injected
+    // marker remains visible around it for a direct motion comparison.
+    quad->size = {0.03f, 0.03f};
 
     return true;
 }
@@ -3935,8 +3950,20 @@ XRAPI_ATTR XrResult XRAPI_CALL layerEndFrame(
             }
 
             if (logReady) {
+                XrVector3f loggedTarget{0.0f, 0.0f, 0.0f};
+                {
+                    std::lock_guard<std::mutex> lock(gStateMutex);
+                    loggedTarget = gProximityTarget;
+                }
+
                 logLine(
-                    "COMPOSITION_QUAD: submitting separate LOCAL-space quad"
+                    std::string(
+                        "COMPOSITION_QUAD: submitting calibrated UFC_ENTER "
+                        "LOCAL-space quad, x="
+                    ) +
+                    std::to_string(loggedTarget.x) +
+                    ", y=" + std::to_string(loggedTarget.y) +
+                    ", z=" + std::to_string(loggedTarget.z)
                 );
             }
 
