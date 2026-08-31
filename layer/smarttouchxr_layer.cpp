@@ -76,6 +76,18 @@ PFN_xrEnumerateSwapchainImages gNextEnumerateSwapchainImages = nullptr;
 PFN_xrAcquireSwapchainImage gNextAcquireSwapchainImage = nullptr;
 PFN_xrWaitSwapchainImage gNextWaitSwapchainImage = nullptr;
 PFN_xrReleaseSwapchainImage gNextReleaseSwapchainImage = nullptr;
+
+// Experimental separate OpenXR composition-layer overlay.
+// This marker is NOT drawn into DCS projection swapchains.
+ID3D11Device* gCompositionD3D11Device = nullptr;
+XrSession gCompositionSession = XR_NULL_HANDLE;
+XrSpace gCompositionLocalSpace = XR_NULL_HANDLE;
+XrSwapchain gCompositionSwapchain = XR_NULL_HANDLE;
+std::vector<XrSwapchainImageD3D11KHR> gCompositionSwapchainImages;
+bool gCompositionQuadReady = false;
+bool gCompositionQuadLoggedReady = false;
+uint32_t gCompositionWidth = 256;
+uint32_t gCompositionHeight = 256;
 uint64_t gEndFrameCallCount = 0;
 
 // Render-timing diagnostics. No rendering behavior is changed by these fields.
@@ -343,7 +355,18 @@ void logSessionCreateChain(const void* next) {
                 );
 
                 if (binding->device != nullptr) {
-                    const D3D_FEATURE_LEVEL featureLevel =
+                        {
+                            std::lock_guard<std::mutex> lock(gStateMutex);
+                            if (gCompositionD3D11Device != binding->device) {
+                                if (gCompositionD3D11Device != nullptr) {
+                                    gCompositionD3D11Device->Release();
+                                }
+                                gCompositionD3D11Device = binding->device;
+                                gCompositionD3D11Device->AddRef();
+                            }
+                        }
+
+                        const D3D_FEATURE_LEVEL featureLevel =
                         binding->device->GetFeatureLevel();
 
                     ID3D11DeviceContext* immediateContext = nullptr;
@@ -435,9 +458,33 @@ XRAPI_ATTR XrResult XRAPI_CALL layerCreateSession(
         )
     );
 
+    if (
+
+
+        XR_SUCCEEDED(result) &&
+
+
+        session != nullptr &&
+
+
+        *session != XR_NULL_HANDLE
+
+
+    ) {
+
+
+        std::lock_guard<std::mutex> lock(gStateMutex);
+
+
+        gCompositionSession = *session;
+
+
+    }
+
+
+
     return result;
 }
-
 
 std::string swapchainLabel(XrSwapchain swapchain) {
     return std::to_string(
@@ -2997,6 +3044,14 @@ XRAPI_ATTR XrResult XRAPI_CALL layerCreateReferenceSpace(
         {
             std::lock_guard<std::mutex> lock(gStateMutex);
             gReferenceSpaceTypes[*space] = createInfo->referenceSpaceType;
+
+            if (
+                createInfo->referenceSpaceType ==
+                    XR_REFERENCE_SPACE_TYPE_LOCAL &&
+                gCompositionLocalSpace == XR_NULL_HANDLE
+            ) {
+                gCompositionLocalSpace = *space;
+            }
         }
 
         logLine(
@@ -3034,6 +3089,10 @@ XRAPI_ATTR XrResult XRAPI_CALL layerDestroySpace(
     if (XR_SUCCEEDED(result)) {
         std::lock_guard<std::mutex> lock(gStateMutex);
         gReferenceSpaceTypes.erase(space);
+        if (space == gCompositionLocalSpace) {
+            gCompositionLocalSpace = XR_NULL_HANDLE;
+            gCompositionQuadReady = false;
+        }
     }
 
     if (std::strcmp(trackedType, "UNTRACKED_SPACE") != 0) {
@@ -3465,6 +3524,270 @@ XRAPI_ATTR XrResult XRAPI_CALL layerLocateViews(
     return result;
 }
 
+bool ensureCompositionQuadSwapchain() {
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        if (
+            gCompositionQuadReady &&
+            gCompositionSwapchain != XR_NULL_HANDLE &&
+            !gCompositionSwapchainImages.empty()
+        ) {
+            return true;
+        }
+    }
+
+    PFN_xrCreateSwapchain nextCreate = nullptr;
+    PFN_xrEnumerateSwapchainImages nextEnumerate = nullptr;
+    XrSession session = XR_NULL_HANDLE;
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        nextCreate = gNextCreateSwapchain;
+        nextEnumerate = gNextEnumerateSwapchainImages;
+        session = gCompositionSession;
+    }
+
+    if (
+        nextCreate == nullptr ||
+        nextEnumerate == nullptr ||
+        session == XR_NULL_HANDLE
+    ) {
+        return false;
+    }
+
+    XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    ci.usageFlags =
+        XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+        XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    ci.format =
+        static_cast<int64_t>(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+    ci.sampleCount = 1;
+    ci.width = gCompositionWidth;
+    ci.height = gCompositionHeight;
+    ci.faceCount = 1;
+    ci.arraySize = 1;
+    ci.mipCount = 1;
+
+    XrSwapchain swapchain = XR_NULL_HANDLE;
+    XrResult result = nextCreate(session, &ci, &swapchain);
+
+    if (XR_FAILED(result) || swapchain == XR_NULL_HANDLE) {
+        logLine(
+            std::string("COMPOSITION_QUAD: xrCreateSwapchain failed, result=") +
+            std::to_string(static_cast<int>(result))
+        );
+        return false;
+    }
+
+    uint32_t imageCount = 0;
+    result = nextEnumerate(swapchain, 0, &imageCount, nullptr);
+
+    if (XR_FAILED(result) || imageCount == 0) {
+        logLine(
+            std::string("COMPOSITION_QUAD: image count failed, result=") +
+            std::to_string(static_cast<int>(result))
+        );
+        return false;
+    }
+
+    std::vector<XrSwapchainImageD3D11KHR> images;
+    images.resize(imageCount);
+    for (auto& image : images) {
+        image = {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR};
+    }
+
+    result = nextEnumerate(
+        swapchain,
+        imageCount,
+        &imageCount,
+        reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data())
+    );
+
+    if (XR_FAILED(result)) {
+        logLine(
+            std::string("COMPOSITION_QUAD: enumerate images failed, result=") +
+            std::to_string(static_cast<int>(result))
+        );
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        gCompositionSwapchain = swapchain;
+        gCompositionSwapchainImages = std::move(images);
+        gCompositionQuadReady = true;
+    }
+
+    logLine(
+        std::string("COMPOSITION_QUAD: swapchain ready, images=") +
+        std::to_string(imageCount)
+    );
+
+    return true;
+}
+
+bool renderCompositionQuadImage() {
+    if (!ensureCompositionQuadSwapchain()) {
+        return false;
+    }
+
+    PFN_xrAcquireSwapchainImage nextAcquire = nullptr;
+    PFN_xrWaitSwapchainImage nextWait = nullptr;
+    PFN_xrReleaseSwapchainImage nextRelease = nullptr;
+    XrSwapchain swapchain = XR_NULL_HANDLE;
+    ID3D11Device* device = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        nextAcquire = gNextAcquireSwapchainImage;
+        nextWait = gNextWaitSwapchainImage;
+        nextRelease = gNextReleaseSwapchainImage;
+        swapchain = gCompositionSwapchain;
+        device = gCompositionD3D11Device;
+        if (device != nullptr) {
+            device->AddRef();
+        }
+    }
+
+    if (
+        nextAcquire == nullptr ||
+        nextWait == nullptr ||
+        nextRelease == nullptr ||
+        swapchain == XR_NULL_HANDLE ||
+        device == nullptr
+    ) {
+        if (device != nullptr) {
+            device->Release();
+        }
+        return false;
+    }
+
+    XrSwapchainImageAcquireInfo acquireInfo{
+        XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO
+    };
+    uint32_t imageIndex = 0;
+
+    XrResult result =
+        nextAcquire(swapchain, &acquireInfo, &imageIndex);
+
+    if (XR_FAILED(result)) {
+        device->Release();
+        return false;
+    }
+
+    XrSwapchainImageWaitInfo waitInfo{
+        XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO
+    };
+    waitInfo.timeout = XR_INFINITE_DURATION;
+
+    result = nextWait(swapchain, &waitInfo);
+    if (XR_FAILED(result)) {
+        device->Release();
+        return false;
+    }
+
+    ID3D11Texture2D* texture = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        if (imageIndex < gCompositionSwapchainImages.size()) {
+            texture = gCompositionSwapchainImages[imageIndex].texture;
+            if (texture != nullptr) {
+                texture->AddRef();
+            }
+        }
+    }
+
+    bool rendered = false;
+
+    if (texture != nullptr) {
+        ID3D11RenderTargetView* rtv = nullptr;
+
+        D3D11_RENDER_TARGET_VIEW_DESC desc{};
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        desc.Texture2D.MipSlice = 0;
+
+        HRESULT hr =
+            device->CreateRenderTargetView(texture, &desc, &rtv);
+
+        if (SUCCEEDED(hr) && rtv != nullptr) {
+            ID3D11DeviceContext* context = nullptr;
+            device->GetImmediateContext(&context);
+
+            if (context != nullptr) {
+                const FLOAT color[4] = {
+                    1.0f, 0.0f, 0.85f, 1.0f
+                };
+                context->ClearRenderTargetView(rtv, color);
+                context->Flush();
+                context->Release();
+                rendered = true;
+            }
+
+            rtv->Release();
+        }
+
+        texture->Release();
+    }
+
+    device->Release();
+
+    XrSwapchainImageReleaseInfo releaseInfo{
+        XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO
+    };
+
+    XrResult releaseResult =
+        nextRelease(swapchain, &releaseInfo);
+
+    return rendered && XR_SUCCEEDED(releaseResult);
+}
+
+bool buildCompositionTestQuad(XrCompositionLayerQuad* quad) {
+    if (quad == nullptr) {
+        return false;
+    }
+
+    XrSpace localSpace = XR_NULL_HANDLE;
+    XrSwapchain swapchain = XR_NULL_HANDLE;
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        localSpace = gCompositionLocalSpace;
+        swapchain = gCompositionSwapchain;
+    }
+
+    if (
+        localSpace == XR_NULL_HANDLE ||
+        swapchain == XR_NULL_HANDLE
+    ) {
+        return false;
+    }
+
+    *quad = XrCompositionLayerQuad{
+        XR_TYPE_COMPOSITION_LAYER_QUAD
+    };
+
+    quad->layerFlags =
+        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    quad->space = localSpace;
+    quad->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+
+    quad->subImage.swapchain = swapchain;
+    quad->subImage.imageRect.offset = {0, 0};
+    quad->subImage.imageRect.extent = {
+        static_cast<int32_t>(gCompositionWidth),
+        static_cast<int32_t>(gCompositionHeight)
+    };
+    quad->subImage.imageArrayIndex = 0;
+
+    // Fixed world/local-space test panel.
+    quad->pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+    quad->pose.position = {0.0f, -0.10f, -0.65f};
+    quad->size = {0.05f, 0.05f};
+
+    return true;
+}
 XRAPI_ATTR XrResult XRAPI_CALL layerEndFrame(
     XrSession session,
     const XrFrameEndInfo* frameEndInfo
@@ -3572,6 +3895,53 @@ XRAPI_ATTR XrResult XRAPI_CALL layerEndFrame(
             ", layerCount=" +
             std::to_string(layerCount)
         );
+    }    if (
+        frameEndInfo != nullptr &&
+        frameEndInfo->layers != nullptr &&
+        renderCompositionQuadImage()
+    ) {
+        XrCompositionLayerQuad testQuad{
+            XR_TYPE_COMPOSITION_LAYER_QUAD
+        };
+
+        if (buildCompositionTestQuad(&testQuad)) {
+            std::vector<const XrCompositionLayerBaseHeader*> layers;
+            layers.reserve(
+                static_cast<size_t>(frameEndInfo->layerCount) + 1
+            );
+
+            for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
+                layers.push_back(frameEndInfo->layers[i]);
+            }
+
+            layers.push_back(
+                reinterpret_cast<const XrCompositionLayerBaseHeader*>(
+                    &testQuad
+                )
+            );
+
+            XrFrameEndInfo modified = *frameEndInfo;
+            modified.layerCount =
+                static_cast<uint32_t>(layers.size());
+            modified.layers = layers.data();
+
+            bool logReady = false;
+            {
+                std::lock_guard<std::mutex> lock(gStateMutex);
+                if (!gCompositionQuadLoggedReady) {
+                    gCompositionQuadLoggedReady = true;
+                    logReady = true;
+                }
+            }
+
+            if (logReady) {
+                logLine(
+                    "COMPOSITION_QUAD: submitting separate LOCAL-space quad"
+                );
+            }
+
+            return nextEndFrame(session, &modified);
+        }
     }
 
     return nextEndFrame(session, frameEndInfo);
