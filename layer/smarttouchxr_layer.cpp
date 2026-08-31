@@ -2744,7 +2744,15 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
         calibrationReadyForMarkers = gCalibrationFrameReady;
     }
 
-    if (calibrationReadyForMarkers) {
+    // The old connector validation renderer draws wire cubes directly into
+    // DCS's projection swapchains. Keep the code for reference/A-B testing,
+    // but disable those cubes now that composition quads are validated.
+    constexpr bool kRenderLegacyProjectedConnectorMarkers = false;
+
+    if (
+        kRenderLegacyProjectedConnectorMarkers &&
+        calibrationReadyForMarkers
+    ) {
         // Marker half-size reduced by 40%: 9.0 mm -> 5.4 mm.
         constexpr float kConnectorMarkerHalfSize = 0.0054f;
 
@@ -2768,7 +2776,7 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
                 destination
             );
         }
-    } else {
+    } else if (kRenderLegacyProjectedConnectorMarkers) {
         appendProjectedCubeRectangles(
             targetCenter,
             0.0125f,
@@ -3743,65 +3751,83 @@ bool renderCompositionQuadImage() {
     return rendered && XR_SUCCEEDED(releaseResult);
 }
 
-bool buildCompositionTestQuad(XrCompositionLayerQuad* quad) {
-    if (quad == nullptr) {
+bool buildCompositionMarkerQuads(
+    std::vector<XrCompositionLayerQuad>* quads
+) {
+    if (quads == nullptr) {
         return false;
     }
 
     XrSpace localSpace = XR_NULL_HANDLE;
     XrSwapchain swapchain = XR_NULL_HANDLE;
     bool calibrationReady = false;
-    bool targetInitialized = false;
-    XrVector3f target{0.0f, 0.0f, 0.0f};
 
     {
         std::lock_guard<std::mutex> lock(gStateMutex);
         localSpace = gCompositionLocalSpace;
         swapchain = gCompositionSwapchain;
         calibrationReady = gCalibrationFrameReady;
-        targetInitialized = gProximityTargetInitialized;
-        target = gProximityTarget;
     }
 
-    // For this A/B test we only show the separate compositor marker once
-    // the three-point calibration has completed. At that point
-    // gProximityTarget is the transformed DCS UFC ENTER connector.
     if (
         localSpace == XR_NULL_HANDLE ||
         swapchain == XR_NULL_HANDLE ||
-        !calibrationReady ||
-        !targetInitialized
+        !calibrationReady
     ) {
         return false;
     }
 
-    *quad = XrCompositionLayerQuad{
-        XR_TYPE_COMPOSITION_LAYER_QUAD
-    };
+    // Same nine DCS connector coordinates already used by the existing
+    // injected marker prototype.
+    static constexpr std::array<Vec3, 9> kCompositionConnectorDcs{{
+        {0.7405973673f, -0.1893186867f,  0.0295004621f}, // Master Caution
+        {0.7397546172f, -0.1867421865f, -0.0041990783f}, // UFC ENTER
+        {0.7297000885f, -0.2159425467f, -0.0223697796f}, // UFC CLR
+        {0.7524973154f, -0.2948178649f, -0.2870004177f}, // Left OSB 1
+        {0.7524973750f, -0.2948178649f, -0.2100002468f}, // Left OSB 5
+        {0.7331519127f, -0.4045305252f, -0.1702503562f}, // Left OSB 10
+        {0.7524974942f, -0.2948176563f,  0.2099997848f}, // Right OSB 1
+        {0.7524974942f, -0.2948176861f,  0.2869997919f}, // Right OSB 5
+        {0.7331521511f, -0.4045309722f,  0.3267496824f}  // Right OSB 10
+    }};
 
-    quad->layerFlags =
-        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-    quad->space = localSpace;
-    quad->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    quads->clear();
+    quads->reserve(kCompositionConnectorDcs.size());
 
-    quad->subImage.swapchain = swapchain;
-    quad->subImage.imageRect.offset = {0, 0};
-    quad->subImage.imageRect.extent = {
-        static_cast<int32_t>(gCompositionWidth),
-        static_cast<int32_t>(gCompositionHeight)
-    };
-    quad->subImage.imageArrayIndex = 0;
+    for (const Vec3& dcsPoint : kCompositionConnectorDcs) {
+        const Vec3 xrPoint = transformDcsToXr(dcsPoint);
 
-    // Same calibrated LOCAL-space point used by the existing UFC ENTER
-    // validation marker, but submitted as its own OpenXR composition layer.
-    quad->pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
-    quad->pose.position = target;
+        XrCompositionLayerQuad quad{
+            XR_TYPE_COMPOSITION_LAYER_QUAD
+        };
 
-    // Smaller than the first architectural prototype so the old injected
-    // marker remains visible around it for a direct motion comparison.
-    quad->size = {0.03f, 0.03f};
+        quad.layerFlags =
+            XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        quad.space = localSpace;
+        quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
 
-    return true;
+        quad.subImage.swapchain = swapchain;
+        quad.subImage.imageRect.offset = {0, 0};
+        quad.subImage.imageRect.extent = {
+            static_cast<int32_t>(gCompositionWidth),
+            static_cast<int32_t>(gCompositionHeight)
+        };
+        quad.subImage.imageArrayIndex = 0;
+
+        // Temporary orientation for this spatial-position validation.
+        // Identity is intentionally kept from the successful UFC ENTER test.
+        // The next renderer stage will use a real stereo projection layer,
+        // which removes the need for one oriented quad per connector.
+        quad.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+        quad.pose.position = {xrPoint.x, xrPoint.y, xrPoint.z};
+
+        // Small marker so we can compare with the old injected wire markers.
+        quad.size = {0.022f, 0.022f};
+
+        quads->push_back(quad);
+    }
+
+    return !quads->empty();
 }
 XRAPI_ATTR XrResult XRAPI_CALL layerEndFrame(
     XrSession session,
@@ -3915,25 +3941,26 @@ XRAPI_ATTR XrResult XRAPI_CALL layerEndFrame(
         frameEndInfo->layers != nullptr &&
         renderCompositionQuadImage()
     ) {
-        XrCompositionLayerQuad testQuad{
-            XR_TYPE_COMPOSITION_LAYER_QUAD
-        };
+        std::vector<XrCompositionLayerQuad> markerQuads;
 
-        if (buildCompositionTestQuad(&testQuad)) {
+        if (buildCompositionMarkerQuads(&markerQuads)) {
             std::vector<const XrCompositionLayerBaseHeader*> layers;
             layers.reserve(
-                static_cast<size_t>(frameEndInfo->layerCount) + 1
+                static_cast<size_t>(frameEndInfo->layerCount) +
+                markerQuads.size()
             );
 
             for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
                 layers.push_back(frameEndInfo->layers[i]);
             }
 
-            layers.push_back(
-                reinterpret_cast<const XrCompositionLayerBaseHeader*>(
-                    &testQuad
-                )
-            );
+            for (const XrCompositionLayerQuad& markerQuad : markerQuads) {
+                layers.push_back(
+                    reinterpret_cast<const XrCompositionLayerBaseHeader*>(
+                        &markerQuad
+                    )
+                );
+            }
 
             XrFrameEndInfo modified = *frameEndInfo;
             modified.layerCount =
@@ -3950,20 +3977,13 @@ XRAPI_ATTR XrResult XRAPI_CALL layerEndFrame(
             }
 
             if (logReady) {
-                XrVector3f loggedTarget{0.0f, 0.0f, 0.0f};
-                {
-                    std::lock_guard<std::mutex> lock(gStateMutex);
-                    loggedTarget = gProximityTarget;
-                }
-
                 logLine(
                     std::string(
-                        "COMPOSITION_QUAD: submitting calibrated UFC_ENTER "
-                        "LOCAL-space quad, x="
+                        "COMPOSITION_MARKERS: submitting calibrated markers, "
+                        "count="
                     ) +
-                    std::to_string(loggedTarget.x) +
-                    ", y=" + std::to_string(loggedTarget.y) +
-                    ", z=" + std::to_string(loggedTarget.z)
+                    std::to_string(markerQuads.size()) +
+                    ", sharedSwapchain=true"
                 );
             }
 
