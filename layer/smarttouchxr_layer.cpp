@@ -65,6 +65,7 @@ PFN_xrCreateHandTrackerEXT gNextCreateHandTracker = nullptr;
 PFN_xrDestroyHandTrackerEXT gNextDestroyHandTracker = nullptr;
 PFN_xrLocateHandJointsEXT gNextLocateHandJoints = nullptr;
 PFN_xrEndFrame gNextEndFrame = nullptr;
+PFN_xrWaitFrame gNextWaitFrame = nullptr;
 PFN_xrLocateViews gNextLocateViews = nullptr;
 PFN_xrCreateReferenceSpace gNextCreateReferenceSpace = nullptr;
 PFN_xrDestroySpace gNextDestroySpace = nullptr;
@@ -76,6 +77,21 @@ PFN_xrAcquireSwapchainImage gNextAcquireSwapchainImage = nullptr;
 PFN_xrWaitSwapchainImage gNextWaitSwapchainImage = nullptr;
 PFN_xrReleaseSwapchainImage gNextReleaseSwapchainImage = nullptr;
 uint64_t gEndFrameCallCount = 0;
+
+// Render-timing diagnostics. No rendering behavior is changed by these fields.
+uint64_t gWaitFrameCallCount = 0;
+uint64_t gLocateViewsCallCount = 0;
+uint64_t gReleaseDiagnosticCount = 0;
+XrTime gLatestPredictedDisplayTime = 0;
+XrDuration gLatestPredictedDisplayPeriod = 0;
+XrBool32 gLatestShouldRender = XR_FALSE;
+XrTime gLatestLocateDisplayTime = 0;
+LARGE_INTEGER gLatestWaitFrameQpc{};
+LARGE_INTEGER gLatestLocateViewsQpc{};
+LARGE_INTEGER gLatestReleaseQpc{};
+LARGE_INTEGER gLatestEndFrameQpc{};
+bool gLoggedWaitFrameIntercept = false;
+
 bool gLoggedCreateHandTrackerIntercept = false;
 bool gLoggedDestroyHandTrackerIntercept = false;
 bool gLoggedLocateHandJointsIntercept = false;
@@ -135,6 +151,49 @@ std::array<XrView, 2> gLatestViews{{
     {XR_TYPE_VIEW},
     {XR_TYPE_VIEW}
 }};
+
+// Experimental A/B visual smoothing.
+// This affects ONLY the view pose used to project SmartTouchXR graphics.
+// Tracking, calibration coordinates, proximity and click logic remain raw.
+std::array<XrView, 2> gSmoothedViews{{
+    {XR_TYPE_VIEW},
+    {XR_TYPE_VIEW}
+}};
+bool gSmoothedViewsInitialized = false;
+bool gVisualSmoothingEnabled = false;   // Start in RAW mode.
+bool gVisualSmoothingShortcutWasDown = false;
+
+// Experimental late-pose mode.
+// We repeat the runtime's downstream xrLocateViews immediately before
+// SmartTouchXR draws into the DCS swapchain, using the SAME displayTime
+// and space that DCS supplied earlier in the frame.
+bool gLatePoseEnabled = false;
+bool gLatePoseShortcutWasDown = false;
+std::mutex gLatePoseMutex;
+
+std::array<XrView, 2> gLateViews{{
+    {XR_TYPE_VIEW},
+    {XR_TYPE_VIEW}
+}};
+bool gLateViewsValid = false;
+XrTime gLateViewsDisplayTime = 0;
+
+// LATE_SMOOTH: subtle filtering applied AFTER the late xrLocateViews.
+// This is intentionally much lighter than the original SMOOTH test.
+bool gLateSmoothEnabled = false;
+bool gLateSmoothShortcutWasDown = false;
+std::array<XrView, 2> gLateSmoothedViews{{
+    {XR_TYPE_VIEW},
+    {XR_TYPE_VIEW}
+}};
+bool gLateSmoothedViewsInitialized = false;
+
+XrSession gLatestViewSession = XR_NULL_HANDLE;
+XrViewConfigurationType gLatestViewConfigurationType =
+    XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+XrTime gLatestViewDisplayTime = 0;
+uint64_t gLatestViewCaptureTickMs = 0;
+
 uint32_t gLatestViewCount = 0;
 XrViewStateFlags gLatestViewStateFlags = 0;
 XrSpace gLatestViewSpace = XR_NULL_HANDLE;
@@ -1145,6 +1204,315 @@ void resetCalibrationState(const char* source) {
     logLine("Calibration unlocked; waiting for three calibration points");
 }
 
+XrQuaternionf normalizedQuaternion(const XrQuaternionf& q) {
+    const float lengthSquared =
+        q.x * q.x +
+        q.y * q.y +
+        q.z * q.z +
+        q.w * q.w;
+
+    if (lengthSquared <= 1.0e-12f) {
+        return {0.0f, 0.0f, 0.0f, 1.0f};
+    }
+
+    const float inverseLength = 1.0f / std::sqrt(lengthSquared);
+    return {
+        q.x * inverseLength,
+        q.y * inverseLength,
+        q.z * inverseLength,
+        q.w * inverseLength
+    };
+}
+
+XrQuaternionf nlerpQuaternionShortest(
+    const XrQuaternionf& from,
+    const XrQuaternionf& to,
+    float alpha
+) {
+    XrQuaternionf target = to;
+
+    const float dot =
+        from.x * to.x +
+        from.y * to.y +
+        from.z * to.z +
+        from.w * to.w;
+
+    // q and -q represent the same rotation. Keep interpolation on the
+    // shortest hemisphere so we never take a long rotational path.
+    if (dot < 0.0f) {
+        target.x = -target.x;
+        target.y = -target.y;
+        target.z = -target.z;
+        target.w = -target.w;
+    }
+
+    XrQuaternionf blended{
+        from.x + (target.x - from.x) * alpha,
+        from.y + (target.y - from.y) * alpha,
+        from.z + (target.z - from.z) * alpha,
+        from.w + (target.w - from.w) * alpha
+    };
+
+    return normalizedQuaternion(blended);
+}
+
+XrView smoothedVisualView(
+    const XrView& previous,
+    const XrView& current,
+    float alpha
+) {
+    XrView result = current;
+
+    result.pose.position.x =
+        previous.pose.position.x +
+        (current.pose.position.x - previous.pose.position.x) * alpha;
+    result.pose.position.y =
+        previous.pose.position.y +
+        (current.pose.position.y - previous.pose.position.y) * alpha;
+    result.pose.position.z =
+        previous.pose.position.z +
+        (current.pose.position.z - previous.pose.position.z) * alpha;
+
+    result.pose.orientation = nlerpQuaternionShortest(
+        previous.pose.orientation,
+        current.pose.orientation,
+        alpha
+    );
+
+    // Keep the current FOV untouched. We are testing head-pose smoothing,
+    // not changing the optical projection.
+    result.fov = current.fov;
+    return result;
+}
+
+bool pollVisualSmoothingShortcut() {
+    const bool controlDown =
+        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool shiftDown =
+        (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool sDown =
+        (GetAsyncKeyState('S') & 0x8000) != 0;
+
+    const bool shortcutDown = controlDown && shiftDown && sDown;
+    const bool pressedNow =
+        shortcutDown && !gVisualSmoothingShortcutWasDown;
+
+    gVisualSmoothingShortcutWasDown = shortcutDown;
+    return pressedNow;
+}
+bool pollLateSmoothShortcut() {
+    const bool controlDown =
+        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool shiftDown =
+        (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool kDown =
+        (GetAsyncKeyState('K') & 0x8000) != 0;
+
+    const bool shortcutDown = controlDown && shiftDown && kDown;
+    const bool pressedNow =
+        shortcutDown && !gLateSmoothShortcutWasDown;
+
+    gLateSmoothShortcutWasDown = shortcutDown;
+    return pressedNow;
+}
+bool pollLatePoseShortcut() {
+    const bool controlDown =
+        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool shiftDown =
+        (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool lDown =
+        (GetAsyncKeyState('L') & 0x8000) != 0;
+
+    const bool shortcutDown = controlDown && shiftDown && lDown;
+    const bool pressedNow =
+        shortcutDown && !gLatePoseShortcutWasDown;
+
+    gLatePoseShortcutWasDown = shortcutDown;
+    return pressedNow;
+}
+
+float quaternionAngularDeltaDegrees(
+    const XrQuaternionf& a,
+    const XrQuaternionf& b
+) {
+    float dot =
+        a.x * b.x +
+        a.y * b.y +
+        a.z * b.z +
+        a.w * b.w;
+
+    dot = std::fabs(dot);
+    dot = std::min(1.0f, std::max(0.0f, dot));
+
+    constexpr float kRadiansToDegrees = 57.29577951308232f;
+    return 2.0f * std::acos(dot) * kRadiansToDegrees;
+}
+
+bool refreshLateVisualViewsIfNeeded() {
+    if (!gLatePoseEnabled) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lateLock(gLatePoseMutex);
+
+    PFN_xrLocateViews nextLocateViews = nullptr;
+    XrSession session = XR_NULL_HANDLE;
+    XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
+    std::array<XrView, 2> originalViews{{
+        {XR_TYPE_VIEW},
+        {XR_TYPE_VIEW}
+    }};
+    uint64_t originalCaptureTickMs = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+
+        if (
+            !gLatePoseEnabled ||
+            gNextLocateViews == nullptr ||
+            gLatestViewSession == XR_NULL_HANDLE ||
+            gLatestViewSpace == XR_NULL_HANDLE ||
+            gLatestViewDisplayTime == 0 ||
+            gLatestViewCount < 2
+        ) {
+            return false;
+        }
+
+        // One late locate for the whole stereo frame. The second eye release
+        // reuses this cached pair.
+        if (
+            gLateViewsValid &&
+            gLateViewsDisplayTime == gLatestViewDisplayTime
+        ) {
+            return true;
+        }
+
+        nextLocateViews = gNextLocateViews;
+        session = gLatestViewSession;
+
+        locateInfo.viewConfigurationType = gLatestViewConfigurationType;
+        locateInfo.displayTime = gLatestViewDisplayTime;
+        locateInfo.space = gLatestViewSpace;
+
+        originalViews[0] = gLatestViews[0];
+        originalViews[1] = gLatestViews[1];
+        originalCaptureTickMs = gLatestViewCaptureTickMs;
+    }
+
+    XrViewState lateState{XR_TYPE_VIEW_STATE};
+    std::array<XrView, 2> lateViews{{
+        {XR_TYPE_VIEW},
+        {XR_TYPE_VIEW}
+    }};
+    uint32_t lateCount = 0;
+
+    const XrResult result = nextLocateViews(
+        session,
+        &locateInfo,
+        &lateState,
+        2,
+        &lateCount,
+        lateViews.data()
+    );
+
+    const bool valid =
+        XR_SUCCEEDED(result) &&
+        lateCount >= 2 &&
+        (lateState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0 &&
+        (lateState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
+
+    if (!valid) {
+        logLine(
+            std::string("LATE_VIEW: xrLocateViews failed or invalid, result=") +
+            std::to_string(static_cast<int>(result)) +
+            ", count=" + std::to_string(lateCount) +
+            ", flags=" +
+            std::to_string(
+                static_cast<unsigned long long>(lateState.viewStateFlags)
+            )
+        );
+        return false;
+    }
+
+    const float dx =
+        lateViews[0].pose.position.x -
+        originalViews[0].pose.position.x;
+    const float dy =
+        lateViews[0].pose.position.y -
+        originalViews[0].pose.position.y;
+    const float dz =
+        lateViews[0].pose.position.z -
+        originalViews[0].pose.position.z;
+
+    const float positionDeltaMm =
+        std::sqrt(dx * dx + dy * dy + dz * dz) * 1000.0f;
+
+    const float orientationDeltaDeg =
+        quaternionAngularDeltaDegrees(
+            originalViews[0].pose.orientation,
+            lateViews[0].pose.orientation
+        );
+
+    const uint64_t ageBeforeRelocateMs =
+        originalCaptureTickMs > 0
+            ? (GetTickCount64() - originalCaptureTickMs)
+            : 0;
+
+    bool shouldLogSample = false;
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        gLateViews[0] = lateViews[0];
+        gLateViews[1] = lateViews[1];
+        gLateViewsValid = true;
+        gLateViewsDisplayTime = locateInfo.displayTime;
+
+        if (!gLateSmoothedViewsInitialized) {
+            gLateSmoothedViews[0] = lateViews[0];
+            gLateSmoothedViews[1] = lateViews[1];
+            gLateSmoothedViewsInitialized = true;
+        } else if (gLateSmoothEnabled) {
+            constexpr float kLateSmoothAlpha = 0.70f;
+            gLateSmoothedViews[0] = smoothedVisualView(
+                gLateSmoothedViews[0],
+                lateViews[0],
+                kLateSmoothAlpha
+            );
+            gLateSmoothedViews[1] = smoothedVisualView(
+                gLateSmoothedViews[1],
+                lateViews[1],
+                kLateSmoothAlpha
+            );
+        } else {
+            // When LATE_SMOOTH is off, keep the filter exactly caught up
+            // with LATE so enabling it cannot create a visual jump.
+            gLateSmoothedViews[0] = lateViews[0];
+            gLateSmoothedViews[1] = lateViews[1];
+        }
+
+        static uint64_t lateLocateCount = 0;
+        ++lateLocateCount;
+        shouldLogSample =
+            lateLocateCount == 1 ||
+            (lateLocateCount % 300ULL) == 0ULL;
+    }
+
+    if (shouldLogSample) {
+        logLine(
+            std::string("LATE_VIEW_SAMPLE: ageBeforeRelocateMs=") +
+            std::to_string(ageBeforeRelocateMs) +
+            ", positionDeltaMm=" +
+            std::to_string(positionDeltaMm) +
+            ", orientationDeltaDeg=" +
+            std::to_string(orientationDeltaDeg) +
+            ", displayTime=" +
+            std::to_string(
+                static_cast<long long>(locateInfo.displayTime)
+            )
+        );
+    }
+
+    return true;
+}
 bool pollCalibrationResetShortcut() {
     const bool controlDown =
         (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -1797,6 +2165,105 @@ void appendProjectedCircleRectangles(
 }
 
 void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
+    if (pollLateSmoothShortcut()) {
+        bool enabled = false;
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+
+            gLateSmoothEnabled = !gLateSmoothEnabled;
+            enabled = gLateSmoothEnabled;
+
+            if (enabled) {
+                // LATE_SMOOTH always uses the late-pose path.
+                gLatePoseEnabled = true;
+                gVisualSmoothingEnabled = false;
+
+                // Start from the latest known late pose with no jump.
+                if (gLateViewsValid) {
+                    gLateSmoothedViews[0] = gLateViews[0];
+                    gLateSmoothedViews[1] = gLateViews[1];
+                    gLateSmoothedViewsInitialized = true;
+                }
+            } else {
+                // Toggling K off returns to plain LATE, not RAW.
+                gLatePoseEnabled = true;
+            }
+
+            gLateViewsValid = false;
+            gLateViewsDisplayTime = 0;
+        }
+
+        logLine(
+            std::string("LATE_SMOOTH: mode=") +
+            (enabled ? "LATE_SMOOTH" : "LATE") +
+            ", alpha=0.70, shortcut=Ctrl+Shift+K"
+        );
+    }
+
+    if (pollLatePoseShortcut()) {
+        bool lateEnabled = false;
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gLatePoseEnabled = !gLatePoseEnabled;
+            lateEnabled = gLatePoseEnabled;
+
+            // Ctrl+Shift+L always means plain LATE/RAW comparison.
+            gLateSmoothEnabled = false;
+
+            // Keep the experiment unambiguous: LATE and SMOOTH are mutually
+            // exclusive. LATE tests timing, not filtering.
+            if (lateEnabled) {
+                gVisualSmoothingEnabled = false;
+            }
+
+            gLateViewsValid = false;
+            gLateViewsDisplayTime = 0;
+        }
+
+        logLine(
+            std::string("LATE_VIEW: mode=") +
+            (lateEnabled ? "LATE" : "RAW") +
+            ", smoothing=" +
+            (lateEnabled ? "OFF" : "unchanged") +
+            ", shortcut=Ctrl+Shift+L"
+        );
+    }
+
+    // If LATE is enabled, ask the runtime for a fresher prediction now,
+    // immediately before our swapchain drawing. The helper caches the
+    // resulting stereo pair so both eyes use the same late-locate instant.
+    refreshLateVisualViewsIfNeeded();
+
+    if (pollVisualSmoothingShortcut()) {
+        bool smoothingEnabled = false;
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gVisualSmoothingEnabled = !gVisualSmoothingEnabled;
+            smoothingEnabled = gVisualSmoothingEnabled;
+
+            if (smoothingEnabled) {
+                gLatePoseEnabled = false;
+                gLateSmoothEnabled = false;
+                gLateViewsValid = false;
+                gLateViewsDisplayTime = 0;
+            }
+
+            // Start a newly enabled filter from the current raw pose.
+            // This prevents a discontinuity at the instant of the toggle.
+            if (smoothingEnabled && gLatestViewCount >= 2) {
+                gSmoothedViews[0] = gLatestViews[0];
+                gSmoothedViews[1] = gLatestViews[1];
+                gSmoothedViewsInitialized = true;
+            }
+        }
+
+        logLine(
+            std::string("VISUAL_SMOOTHING: mode=") +
+            (smoothingEnabled ? "SMOOTH" : "RAW") +
+            ", alpha=0.35, shortcut=Ctrl+Shift+S"
+        );
+    }
+
     ID3D11RenderTargetView* renderTargetView = nullptr;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -1877,7 +2344,30 @@ void drawProximityPrototype(XrSwapchain swapchain, int64_t imageIndex) {
         width = it->second.createInfo.width;
         height = it->second.createInfo.height;
         eyeIndex = std::min<uint32_t>(it->second.eyeIndex, 1);
-        eyeView = gLatestViews[eyeIndex];
+        if (
+            gLatePoseEnabled &&
+            gLateSmoothEnabled &&
+            gLateViewsValid &&
+            gLateSmoothedViewsInitialized &&
+            gLateViewsDisplayTime == gLatestViewDisplayTime
+        ) {
+            eyeView = gLateSmoothedViews[eyeIndex];
+        } else if (
+            gLatePoseEnabled &&
+            gLateViewsValid &&
+            gLateViewsDisplayTime == gLatestViewDisplayTime
+        ) {
+            eyeView = gLateViews[eyeIndex];
+        } else if (
+            gVisualSmoothingEnabled &&
+            gSmoothedViewsInitialized
+        ) {
+            eyeView = gSmoothedViews[eyeIndex];
+        } else {
+            eyeView = gLatestViews[eyeIndex];
+        }
+
+        // Keep non-visual/world initialization logic on the unfiltered views.
         leftView = gLatestViews[0];
         rightView = gLatestViews[1];
         rightIndexTip = gLatestRightIndexTip;
@@ -2418,6 +2908,14 @@ XRAPI_ATTR XrResult XRAPI_CALL layerReleaseSwapchainImage(
 
     drawProximityPrototype(swapchain, lastIndex);
 
+    LARGE_INTEGER releaseNow{};
+    QueryPerformanceCounter(&releaseNow);
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        ++gReleaseDiagnosticCount;
+        gLatestReleaseQpc = releaseNow;
+    }
+
     const XrResult result = nextRelease(swapchain, releaseInfo);
     uint64_t callCount = 0;
     {
@@ -2816,6 +3314,39 @@ XRAPI_ATTR XrResult XRAPI_CALL layerLocateHandJointsEXT(
     return result;
 }
 
+XRAPI_ATTR XrResult XRAPI_CALL layerWaitFrame(
+    XrSession session,
+    const XrFrameWaitInfo* frameWaitInfo,
+    XrFrameState* frameState
+) {
+    PFN_xrWaitFrame nextWaitFrame = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        nextWaitFrame = gNextWaitFrame;
+    }
+
+    if (nextWaitFrame == nullptr) {
+        logLine("xrWaitFrame: downstream function unavailable");
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+
+    const XrResult result = nextWaitFrame(session, frameWaitInfo, frameState);
+
+    if (XR_SUCCEEDED(result) && frameState != nullptr) {
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        ++gWaitFrameCallCount;
+        gLatestPredictedDisplayTime = frameState->predictedDisplayTime;
+        gLatestPredictedDisplayPeriod = frameState->predictedDisplayPeriod;
+        gLatestShouldRender = frameState->shouldRender;
+        gLatestWaitFrameQpc = now;
+    }
+
+    return result;
+}
 XRAPI_ATTR XrResult XRAPI_CALL layerLocateViews(
     XrSession session,
     const XrViewLocateInfo* viewLocateInfo,
@@ -2852,11 +3383,65 @@ XRAPI_ATTR XrResult XRAPI_CALL layerLocateViews(
         viewCapacityInput >= 2 &&
         *viewCountOutput >= 2
     ) {
+        LARGE_INTEGER locateNow{};
+        QueryPerformanceCounter(&locateNow);
+
         bool shouldLog = false;
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            ++gLocateViewsCallCount;
+            if (viewLocateInfo != nullptr) {
+                gLatestLocateDisplayTime = viewLocateInfo->displayTime;
+            }
+            gLatestLocateViewsQpc = locateNow;
+        }
+
         {
             std::lock_guard<std::mutex> lock(gStateMutex);
             gLatestViews[0] = views[0];
             gLatestViews[1] = views[1];
+
+            gLatestViewSession = session;
+            if (viewLocateInfo != nullptr) {
+                gLatestViewConfigurationType =
+                    viewLocateInfo->viewConfigurationType;
+                gLatestViewDisplayTime =
+                    viewLocateInfo->displayTime;
+            } else {
+                gLatestViewDisplayTime = 0;
+            }
+            gLatestViewCaptureTickMs = GetTickCount64();
+
+            // A new DCS locate means a new frame/displayTime. Force the
+            // LATE cache to be refreshed once, then reused for both eyes.
+            gLateViewsValid = false;
+
+            // Keep a second pair of views for experimental visual-only
+            // smoothing. Updating here avoids applying the filter twice
+            // because DCS releases one swapchain image per eye.
+            if (!gSmoothedViewsInitialized) {
+                gSmoothedViews[0] = views[0];
+                gSmoothedViews[1] = views[1];
+                gSmoothedViewsInitialized = true;
+            } else if (gVisualSmoothingEnabled) {
+                constexpr float kVisualSmoothingAlpha = 0.35f;
+                gSmoothedViews[0] = smoothedVisualView(
+                    gSmoothedViews[0],
+                    views[0],
+                    kVisualSmoothingAlpha
+                );
+                gSmoothedViews[1] = smoothedVisualView(
+                    gSmoothedViews[1],
+                    views[1],
+                    kVisualSmoothingAlpha
+                );
+            } else {
+                // RAW mode tracks the current pose exactly so enabling
+                // smoothing later starts without an artificial jump.
+                gSmoothedViews[0] = views[0];
+                gSmoothedViews[1] = views[1];
+            }
+
             gLatestViewCount = 2;
             gLatestViewStateFlags = viewState->viewStateFlags;
             gLatestViewSpace =
@@ -2898,15 +3483,94 @@ XRAPI_ATTR XrResult XRAPI_CALL layerEndFrame(
         return XR_ERROR_FUNCTION_UNSUPPORTED;
     }
 
+    LARGE_INTEGER endNow{};
+    LARGE_INTEGER qpcFrequency{};
+    QueryPerformanceCounter(&endNow);
+    QueryPerformanceFrequency(&qpcFrequency);
+
+    XrTime predictedDisplayTime = 0;
+    XrDuration predictedDisplayPeriod = 0;
+    XrBool32 shouldRender = XR_FALSE;
+    XrTime locateDisplayTime = 0;
+    uint64_t waitFrameCallCount = 0;
+    uint64_t locateViewsCallCount = 0;
+    uint64_t releaseDiagnosticCount = 0;
+    LARGE_INTEGER waitQpc{};
+    LARGE_INTEGER locateQpc{};
+    LARGE_INTEGER releaseQpc{};
+
+    {
+        std::lock_guard<std::mutex> lock(gStateMutex);
+        gLatestEndFrameQpc = endNow;
+
+        predictedDisplayTime = gLatestPredictedDisplayTime;
+        predictedDisplayPeriod = gLatestPredictedDisplayPeriod;
+        shouldRender = gLatestShouldRender;
+        locateDisplayTime = gLatestLocateDisplayTime;
+        waitFrameCallCount = gWaitFrameCallCount;
+        locateViewsCallCount = gLocateViewsCallCount;
+        releaseDiagnosticCount = gReleaseDiagnosticCount;
+        waitQpc = gLatestWaitFrameQpc;
+        locateQpc = gLatestLocateViewsQpc;
+        releaseQpc = gLatestReleaseQpc;
+    }
+
     if (callCount == 1 || callCount % 300 == 0) {
         const uint32_t layerCount =
             frameEndInfo != nullptr ? frameEndInfo->layerCount : 0;
 
+        const long long displayDeltaNs =
+            (predictedDisplayTime != 0 && locateDisplayTime != 0)
+                ? static_cast<long long>(locateDisplayTime - predictedDisplayTime)
+                : 0LL;
+
+        const double qpcHz =
+            qpcFrequency.QuadPart > 0
+                ? static_cast<double>(qpcFrequency.QuadPart)
+                : 1.0;
+
+        const double waitToLocateMs =
+            (waitQpc.QuadPart != 0 && locateQpc.QuadPart != 0)
+                ? (static_cast<double>(locateQpc.QuadPart - waitQpc.QuadPart) * 1000.0 / qpcHz)
+                : 0.0;
+
+        const double locateToReleaseMs =
+            (locateQpc.QuadPart != 0 && releaseQpc.QuadPart != 0)
+                ? (static_cast<double>(releaseQpc.QuadPart - locateQpc.QuadPart) * 1000.0 / qpcHz)
+                : 0.0;
+
+        const double releaseToEndMs =
+            (releaseQpc.QuadPart != 0)
+                ? (static_cast<double>(endNow.QuadPart - releaseQpc.QuadPart) * 1000.0 / qpcHz)
+                : 0.0;
+
         logLine(
-            std::string("xrEndFrame sample: layerCount=") +
-            std::to_string(layerCount) +
-            ", call=" +
-            std::to_string(callCount)
+            std::string("RENDER_TIMING: endFrame=") +
+            std::to_string(callCount) +
+            ", waitFrame=" +
+            std::to_string(waitFrameCallCount) +
+            ", locateViews=" +
+            std::to_string(locateViewsCallCount) +
+            ", releases=" +
+            std::to_string(releaseDiagnosticCount) +
+            ", predictedDisplayTime=" +
+            std::to_string(static_cast<long long>(predictedDisplayTime)) +
+            ", locateDisplayTime=" +
+            std::to_string(static_cast<long long>(locateDisplayTime)) +
+            ", displayDeltaNs=" +
+            std::to_string(displayDeltaNs) +
+            ", predictedPeriodNs=" +
+            std::to_string(static_cast<long long>(predictedDisplayPeriod)) +
+            ", shouldRender=" +
+            std::to_string(static_cast<int>(shouldRender)) +
+            ", waitToLocateMs=" +
+            std::to_string(waitToLocateMs) +
+            ", locateToReleaseMs=" +
+            std::to_string(locateToReleaseMs) +
+            ", releaseToEndMs=" +
+            std::to_string(releaseToEndMs) +
+            ", layerCount=" +
+            std::to_string(layerCount)
         );
     }
 
@@ -2980,6 +3644,8 @@ XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
         std::strcmp(name, "xrLocateHandJointsEXT") == 0;
     const bool isEndFrame =
         std::strcmp(name, "xrEndFrame") == 0;
+    const bool isWaitFrame =
+        std::strcmp(name, "xrWaitFrame") == 0;
     const bool isLocateViews =
         std::strcmp(name, "xrLocateViews") == 0;
     const bool isCreateReferenceSpace =
@@ -3078,7 +3744,25 @@ XRAPI_ATTR XrResult XRAPI_CALL layerGetInstanceProcAddr(
         if (shouldLog) {
             logLine("Intercepting xrLocateHandJointsEXT");
         }
-    } else if (isLocateViews) {
+    } else if (isWaitFrame) {
+        bool shouldLog = false;
+
+        {
+            std::lock_guard<std::mutex> lock(gStateMutex);
+            gNextWaitFrame = reinterpret_cast<PFN_xrWaitFrame>(*function);
+
+            if (!gLoggedWaitFrameIntercept) {
+                gLoggedWaitFrameIntercept = true;
+                shouldLog = true;
+            }
+        }
+
+        *function =
+            reinterpret_cast<PFN_xrVoidFunction>(layerWaitFrame);
+
+        if (shouldLog) {
+            logLine("Intercepting xrWaitFrame");
+        }    } else if (isLocateViews) {
         bool shouldLog = false;
 
         {
