@@ -35,3 +35,7 @@ SmartTouchXR-runtime.txt
 *.tmp
 *.bak
 *~
+
+# Local experiment backups
+layer/*.before-*
+layer/*.render-timing-backup
